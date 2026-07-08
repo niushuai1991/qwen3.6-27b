@@ -15,9 +15,6 @@ __pycache__/
 *.swp
 *.swo
 
-# Benchmark outputs
-docs/benchmark-*.md
-docs/benchmark-*.json
 
 # Paper (large binary)
 2607.05147.pdf

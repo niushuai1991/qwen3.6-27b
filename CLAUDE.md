@@ -1,0 +1,68 @@
+# Qwen3.6-27B-FP8 部署项目
+
+## 项目概述
+
+Qwen3.6-27B-FP8 vLLM 容器化部署，目标：DSpark 投机解码优化，三阶段推进（MTP → DFlash → DSparkLite → 完整 DSpark）。
+
+## 技术栈
+
+- **模型**: Qwen/Qwen3.6-27B-FP8（29GB）
+- **推理引擎**: vLLM 0.24.0（`vllm/vllm-openai:latest`）
+- **投机解码**: MTP k=3 → DFlash k=7 → DSpark
+- **Benchmark**: llmeter v0.1.12（streaming mode）
+- **训练** (Stage C): DeepSpec (PyTorch + FSDP)
+
+## 硬件约束
+
+- GPU: NVIDIA L40S 46GB VRAM
+- 系统内存: 57GB
+- 显存硬上限: 46GB（必须留余量）
+- 模型路径: `/data/models/Qwen3.6-27B-FP8`
+
+## 关键文件
+
+| 文件 | 用途 |
+|------|------|
+| `docker-compose.yml` | 服务编排 + vLLM 参数 |
+| `benchmark.py` | llmeter 基准测试脚本 |
+| `DEPLOY.md` | 部署指南（面向用户） |
+| `docs/config.md` | 配置参数文档（技术参考） |
+| `docs/design.md` | 架构设计概览 |
+| `docs/performance.md` | 性能追踪总览（跨阶段对比） |
+| `docs/benchmark-*.md` | 各阶段详细性能报告 |
+| `docs/superpowers/plans/2026-07-08-dspark-deploy.md` | 实施计划 |
+
+## 文档约定
+
+- **性能追踪** (`docs/performance.md`) — 各阶段性能总览，跨阶段对比，优化方向分析
+- **性能报告** (`docs/benchmark-*.md`) — 每次 benchmark 自动生成
+- **配置文档** (`docs/config.md`) — 记录所有参数变更，各阶段对照
+- **部署指南** (`DEPLOY.md`) — 面向用户的操作手册
+- **架构设计** (`docs/design.md`) — 高层设计，不超过一屏
+
+## 常用命令
+
+```bash
+# 服务管理
+docker compose up -d                         # 启动
+docker compose logs -f                       # 查看日志
+docker compose down                          # 停止
+
+# 健康检查
+curl -s http://localhost:8000/health         # 服务状态
+nvidia-smi --query-gpu=memory.used --format=csv  # 显存使用
+
+# 基准测试
+uv run python benchmark.py --label <label> --concurrency "1,5,10"
+
+# 查看性能结果
+grep -E "output_tps|TPOT_mean" docs/benchmark-<label>.md
+```
+
+## 验收标准
+
+- 所有 benchmark: 0 失败请求
+- GPU 显存: < 46GB at all times
+- Stage A: output_tps ≥ MTP × 1.30
+- Stage B: output_tps ≥ Stage A × 1.05
+- Stage C: accepted length 达论文水平的 70%+
