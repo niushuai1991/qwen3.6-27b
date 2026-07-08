@@ -10,7 +10,7 @@
 |------|------|---------|------|:---:|:---:|:---:|:---:|:---:|
 | **Baseline** | 2026-07-08 | MTP k=3 | 默认参数 | 36.3 | 170.0 | 309.8 | 6.4ms | — |
 | Stage 0 | 2026-07-08 | MTP k=3 | 默认(已验证最优) | 36.8 | 169.2 | 309.4 | 3.9ms | ≈基线 |
-| Stage A | — | DFlash k=7 | 优化参数 | — | — | — | — | — |
+| Stage A | 2026-07-08 | DFlash k=3（最佳） | baseline 参数 | 35.2 | 162.3 | 219.9 | 3.7ms | 0.71× ✗ 不适用→回退 |
 | Stage B | — | DSparkLite k=7 | 优化参数 | — | — | — | — | — |
 | Stage C | — | DSpark Trained k=7 | 优化参数 | — | — | — | — | — |
 
@@ -92,3 +92,42 @@ ModuleNotFoundError: xxhash is required for the 'xxhash' prefix caching hash alg
 ### Stage 0 总结
 
 默认参数已是最优。baseline（MTP k=3 + 默认参数 + gpu-mem=0.90）即为 Stage A 的干净起点。
+
+---
+
+## Stage A — DFlash 验证（结论：不适用，回退 MTP）
+
+**目标**：MTP k=3 → DFlash，目标 output_tps ≥ MTP × 1.30。
+**结论：DFlash 在当前硬件/配置下全面劣于 MTP，未达标，回退 MTP k=3 baseline。**
+
+### 配置变更
+
+`--speculative-config` 从 MTP k=3 改为 DFlash（drafter `/models/Qwen3.6-27B-DFlash` = `z-lab/Qwen3.6-27B-DFlash`，3.3GB，5 层 qwen3，`block_size=16`，vLLM 0.24 原生 `method:"dflash"`，FlashInfer 支持 non-causal）。其余参数沿用 baseline（8192/0.90/无 xxhash）。
+
+### 测试数据
+
+| 配置 | c=1 | c=5 | c=10 | TPOT(c=10) | acceptance | vs MTP c=10 |
+|------|:---:|:---:|:---:|:---:|:---:|:---:|
+| MTP k=3（baseline） | 36.8 | 169.2 | 309.4 | 3.9ms | — | — |
+| DFlash k=7 | 40.5 | 129.3 | 127.5 | — | ~2.7 | 0.41× |
+| DFlash k=4 | — | — | 174.6* | — | ~2.4 | 0.56× |
+| DFlash k=3（最佳） | 35.2 | 162.3 | 219.9 | 3.7ms | ~2.4 | 0.71× |
+
+\* 快速验证（5 reqs）。报告：[`dflash_k7`](benchmark-dflash_k7.md) · [`dflash_k3`](benchmark-dflash_k3.md) · [`dflash_k3_quick`](benchmark-dflash_k3_quick.md) · [`dflash_k4_quick`](benchmark-dflash_k4_quick.md)
+
+### 根因分析（结构性，非抢占）
+
+1. **独立 drafter 开销（主因）**：DFlash 需 3.3GB 独立 drafter（5 层 Qwen3），每个 decode step 额外一次 forward；MTP 用 target 内置 head，零 drafter 开销。高并发时 drafter forward 被 batch 放大，成为串行瓶颈。
+2. **acceptance 无优势**：DFlash 实测 acceptance ~2.4-2.7（c=1 smoke 的 5.42 为单次峰值异常，中位数 2.66），与 MTP k=3 相当。无 acceptance 收益却有 drafter 开销 → 净负。
+3. **KV cache 压力**：DFlash drafter + spec tokens 占用 KV cache，c=10 usage 92-96%，限制实际并发到 7-8（`max-num-seqs=10` 跑不满）。k=7 KV cache 61,224 tokens vs k=3 79,488。
+4. **k 值 trade-off**：c=1 大 k 略优（acceptance 高），c=10 小 k 优（verify batch 省）。无单一 k 全场景达标。
+5. **非 preemption**：所有配置 0 抢占重算。
+6. `disable_padded_drafter_batch`：`NotImplementedError`（draft models only support padded），不可用。
+
+### 为何 DFlash 理论强但此处失效
+
+DFlash 论文（2-3× over Eagle-3）优势在大模型 + 充足算力，drafter forward 能与 target overlap。本配置：27B FP8 在单 L40S，decode 时 GPU 已被 target 占满，drafter forward 无法 overlap 变串行开销；且 qwen3_5 混合架构下 drafter acceptance 仅 ~2.5。
+
+### 决策
+
+**回退 MTP k=3 baseline**（Stage 0 已验证最优）。DFlash drafter 模型保留在 `/data/models/Qwen3.6-27B-DFlash`（3.3GB），供未来换硬件（多卡/更强 GPU）复用。Stage B（DSparkLite custom_class）依赖 DFlash drafter，同样不适用；Stage C（DeepSpec 训练）受架构/显存/存储多重阻塞，当前硬件不可行。DSpark 路线在单 L40S + 27B 配置下暂止于 MTP baseline。

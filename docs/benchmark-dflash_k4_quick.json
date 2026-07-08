@@ -1,0 +1,22 @@
+[
+  {
+    "label": "dflash_k4_quick",
+    "clients": 10,
+    "n_requests": 5,
+    "max_tokens": 2048,
+    "total_requests": 50,
+    "total_test_time_s": 586.5414901230033,
+    "ttft_p50_s": 90.0276283150015,
+    "ttft_p90_s": 90.0276283150015,
+    "ttlt_p50_s": 102.02270638099799,
+    "ttlt_p90_s": 130.1031117924991,
+    "tpot_p50_s": 0.01962413546164982,
+    "tpot_mean_s": 0.01962413546164982,
+    "output_tps": 174.58389573699714,
+    "rpm": 6.122031931783912,
+    "failed_requests": 0,
+    "input_tokens_avg": 142,
+    "output_tokens_avg": 2048,
+    "prompts_used": 5
+  }
+]

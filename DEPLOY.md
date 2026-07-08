@@ -272,6 +272,7 @@ docker compose -f /data/qwen3.6-27b/docker-compose.yml up -d
 | `dtype 'float8' invalid` | vLLM 新版不支持此参数值 | 改为 `--dtype auto` |
 | 模型作为位置参数 | 新版 vllm serve 语法 | `command: > /models/xxx ` 而非 `--model /models/xxx` |
 | MTP 崩溃 | 高负载下投机解码不稳定 | `num_speculative_tokens` 从 3 降为 1，或去掉 `--speculative-config` |
+| DFlash 比 MTP 慢 | 单卡 27B decode 时 drafter forward 无法 overlap，变串行开销 + KV cache 压力 | 已验证单 L40S 不适用（最佳 k=3 仅 MTP 的 0.71×），保持 MTP k=3；DFlash 需多卡/更强 GPU 才有收益 |
 | 推理速度慢 | 未命中 CUDA Graphs | 首次启动后自动缓存（约 60s），重启秒开 |
 | `huggingface-cli` 报错 | 命令已废弃 | 改用 `hf download` |
 | nvidia-smi 不显示进程 | 容器反复重启或权限问题 | 等容器稳定后重试，或 `sudo nvidia-smi` |
