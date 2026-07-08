@@ -9,7 +9,7 @@
 | 阶段 | 日期 | 投机方法 | 参数 | output_tps (c=1) | output_tps (c=5) | output_tps (c=10) | TPOT mean (c=10) | vs 基线 |
 |------|------|---------|------|:---:|:---:|:---:|:---:|:---:|
 | **Baseline** | 2026-07-08 | MTP k=3 | 默认参数 | 36.3 | 170.0 | 309.8 | 6.4ms | — |
-| Stage 0 | — | MTP k=3 | 优化参数 | — | — | — | — | 失败(见下方) |
+| Stage 0 | 2026-07-08 | MTP k=3 | 默认(已验证最优) | 36.8 | 169.2 | 309.4 | 3.9ms | ≈基线 |
 | Stage A | — | DFlash k=7 | 优化参数 | — | — | — | — | — |
 | Stage B | — | DSparkLite k=7 | 优化参数 | — | — | — | — | — |
 | Stage C | — | DSpark Trained k=7 | 优化参数 | — | — | — | — | — |
@@ -49,29 +49,46 @@
 
 ---
 
-## Stage 0 尝试记录
+## Stage 0 — 根因分析与参数验证
 
-**目标**: 在 MTP k=3 上应用 vLLM 参数优化（`max-num-batched-tokens=16384`, `enable-flashinfer-autotune`, `xxhash`, `gpu-memory-utilization=0.92`）
+**目标**: 验证 vLLM 调度/参数优化能否在 MTP k=3 上提升吞吐。**结论：默认参数已是最优，无需调整。**
 
-### 尝试的参数组合（全部失败）
+### 根因：`--prefix-caching-hash-algo xxhash` 容器缺包（前 4 次失败的真因）
 
-| 尝试 | `batched-tokens` | `gpu-util` | `flashinfer-autotune` | `xxhash` | 结果 |
-|:---:|:---:|:---:|:---:|:---:|------|
-| 1 | 16384 | 0.92 | ✓ | ✓ | Server 崩溃（c=10 时） |
-| 2 | 12288 | 0.92 | ✓ | ✓ | Server 崩溃（c=10 时） |
-| 3 | 8192 | 0.92 | ✓ | ✓ | Server 崩溃（c=10 时） |
-| 4 | 8192 | 0.92 | ✗ | ✓ | Server 崩溃（c=10 时） |
+前 4 次尝试均带 `xxhash`，全部崩溃。traceback 定位到：
 
-### 不支持的参数
-- `--max-num-partial-prefills 2` → vLLM 0.24 报错: `Concurrent Partial Prefill is not supported`
-- `--max-long-partial-prefills 2` → 同上
+```
+File ".../vllm/utils/hashing.py", line 63, in _xxhash_digest
+ModuleNotFoundError: xxhash is required for the 'xxhash' prefix caching hash algorithms.
+→ EngineDeadError → 容器崩溃 → Docker 重启 → 所有请求 "Server disconnected"
+```
 
-### 现象
-- 服务启动正常，health check 返回 200，单次 `curl` 请求成功
-- benchmark 运行时所有请求失败（包括 c=1 的 10 个请求）
-- Server 在 benchmark 期间自动重启
+- 容器 `vllm/vllm-openai:latest` 未安装 `xxhash` 包（`pip show xxhash` → not found）
+- prefix-cache block 哈希仅在生成足够多 token 时触发 → 单次 curl（短输出）不崩，benchmark（max_tokens=2048）必崩
+- **决策**：放弃 xxhash（收益=CPU 哈希微优化；持久化需自定义镜像；与投机解码主线无关），回退默认 sha256
+- **纯 baseline 验证**（移除 xxhash）：output_tps 36.8/169.2/309.4，0 失败 → 根因 100% 确认
 
-### 下一步建议
-- 逐个测试参数变化，先只改 `gpu-memory-utilization 0.90→0.92`，跑 benchmark 确认稳定
-- 再逐个加 `xxhash`、`max-num-batched-tokens`、`flashinfer-autotune`
-- 或者直接跳到 Stage A（DFlash），保持当前稳定的 MTP 参数不变
+### 其余参数结论
+
+| 参数 | 结论 |
+|------|------|
+| `--max-num-partial-prefills` / `--max-long-partial-prefills` | vLLM 0.24 不支持（`Concurrent Partial Prefill is not supported`） |
+| `--enable-flashinfer-autotune` | 非合法 CLI 参数（`vllm serve --help` 无）；日志 `kernel_config` 显示 `enable_flashinfer_autotune=True` 是内部默认值，**默认已开启** |
+| `--gpu-memory-utilization` | 保持 0.90（约束 ≤0.90；显存无压力） |
+
+### `--max-num-batched-tokens` 8192 → 16384（唯一实质变更，已测）
+
+| 并发 | 8192(baseline) | 16384 | 变化 |
+|:---:|:---:|:---:|:---:|
+| output_tps c=1 | 36.8 | 35.9 | 持平 |
+| output_tps c=5 | 169.2 | 169.9 | 持平 |
+| output_tps c=10 | 309.4 | 307.8 | −0.5%（误差内） |
+| c=10 TTFT p50 | 56.7s | 63.8s | **+12.5%（恶化）** |
+
+报告：[`benchmark-mtp_k3_batched16384.md`](benchmark-mtp_k3_batched16384.md) · [`benchmark-mtp_k3_verify_no_xxhash.md`](benchmark-mtp_k3_verify_no_xxhash.md)
+
+**结论**：16384 无吞吐收益，反而轻微恶化 c=10 TTFT（更大 prefill batch 阻塞 decode）。**回退到 8192。**
+
+### Stage 0 总结
+
+默认参数已是最优。baseline（MTP k=3 + 默认参数 + gpu-mem=0.90）即为 Stage A 的干净起点。

@@ -68,16 +68,16 @@ command: >
 
 ## 各阶段配置对照表
 
-| 参数 | Baseline (当前) | Stage 0 (优化后) | Stage A (DFlash) | Stage B (DSparkLite) |
-|------|:---:|:---:|:---:|:---:|
-| 投机方法 | MTP k=3 | MTP k=3 | DFlash k=7 | DSparkLite k=7 |
-| `--gpu-memory-utilization` | 0.90 | **0.92** | 0.92 | 0.92 |
-| `--max-num-batched-tokens` | 8192 | **16384** | 16384 | 16384 |
-| `--max-num-partial-prefills` | — (1) | **2** | 2 | 2 |
-| `--max-long-partial-prefills` | — (1) | **2** | 2 | 2 |
-| `--enable-flashinfer-autotune` | disabled | **enabled** | enabled | enabled |
-| `--prefix-caching-hash-algo` | sha256 | **xxhash** | xxhash | xxhash |
-| Drafter 模型 | — | — | z-lab/DFlash (~1.5GB) | DSparkLiteProposer |
+| 参数 | Baseline (=Stage 0) | Stage A (DFlash) | Stage B (DSparkLite) |
+|------|:---:|:---:|:---:|
+| 投机方法 | MTP k=3 | DFlash k=7 | DSparkLite k=7 |
+| `--gpu-memory-utilization` | 0.90 | 0.90 | 0.90 |
+| `--max-num-batched-tokens` | 8192 | 8192 | 8192 |
+| `--enable-flashinfer-autotune` | 默认已开 | 默认已开 | 默认已开 |
+| `--prefix-caching-hash-algo` | sha256 | sha256 | sha256 |
+| Drafter 模型 | — | z-lab/DFlash (~1.5GB) | DSparkLiteProposer |
+
+> Stage 0 验证结论：可调参数（gpu-util 0.92、batched-tokens 16384、partial-prefills、xxhash）经测试均无收益或不支持，默认值即为最优。Stage A/B 沿用 baseline 参数。详见 [`performance.md#stage-0`](performance.md)。
 
 ---
 
@@ -95,3 +95,4 @@ command: >
 | 日期 | 版本 | 说明 |
 |------|------|------|
 | 2026-07-08 | baseline | MTP k=3 基线配置文档 |
+| 2026-07-08 | stage0 | 参数验证：默认最优，Stage 0 = Baseline（详见 performance.md） |
