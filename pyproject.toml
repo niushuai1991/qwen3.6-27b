@@ -5,6 +5,7 @@ description = "Qwen3.6-27B vLLM deployment with speculative decoding benchmarks"
 requires-python = ">=3.10"
 dependencies = [
     "llmeter>=0.1.12",
+    "openai>=2.44.0",
 ]
 
 [tool.uv]
