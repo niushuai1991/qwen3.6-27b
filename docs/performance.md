@@ -29,11 +29,11 @@
 
 ### 关键指标
 
-| 并发 | output_tps | TTLT p50 | TTLT p90 | TTFT p50 | TPOT mean | 失败 |
-|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| 1 | 36.3 | 56.3s | 59.2s | N/A | N/A | 0 |
-| 5 | 170.0 | 59.6s | 63.6s | 54.8s | 1.1ms | 0 |
-| 10 | 309.8 | 65.1s | 69.1s | 52.4s | 6.4ms | 0 |
+| 并发 | output_tps | TTLT p50 | TTLT p90 | TTFT p50 | TPOT mean | Acceptance | 失败 |
+|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| 1 | 36.3 | 56.3s | 59.2s | N/A | N/A | 2.56 tok/step | 0 |
+| 5 | 170.0 | 59.6s | 63.6s | 54.8s | 1.1ms | 2.56 tok/step | 0 |
+| 10 | 309.8 | 65.1s | 69.1s | 52.4s | 6.4ms | 2.56 tok/step | 0 |
 
 ### 分析
 
@@ -42,6 +42,21 @@
 - **10 并发**: ~309.8 tok/s — 聚合吞吐约单流的 8.5x，TPOT 6.4ms 表明 decode 高效
 - **TTFT**: 52.4s (c=10) — 长 prompt prefill 排队，瓶颈在 `max-num-batched-tokens=8192`
 - **所有并发 0 失败**
+- **Acceptance**（2026-07-09 补测，详见 [`benchmark-mtp_k3_acceptance.md`](benchmark-mtp_k3_acceptance.md)）：实测 2.56 tokens/step（1 target + 1.56 draft），三个 position 独立概率稳定于 73%/49%/34%（并发无关）
+
+### Acceptance 分解
+
+MTP k=3 每个 decode step 产出 = 1（target 保证 token）+ P₀ + P₁ + P₂。vLLM `spec_decode_num_accepted_tokens_per_pos_total` 计数器给出各 position 的独立 acceptance 概率：
+
+| 并发 | P₀ (第1个draft) | P₁ (第2个draft) | P₂ (第3个draft) | 合计 tokens/step |
+|:---:|:---:|:---:|:---:|:---:|
+| 1 | 73.7% | 49.5% | 34.5% | 2.58 |
+| 5 | 73.5% | 49.3% | 33.7% | 2.56 |
+| 10 | 73.4% | 49.2% | 33.6% | 2.56 |
+
+- **并发无关**：三个并发级 acceptance 一致（差异 < 0.2%），说明 acceptance 是模型内在属性
+- **递减规律**：P₀ ≈ 73%，P₁ ≈ 49%，P₂ ≈ 34%——每个位置被接受的独立概率随位置递增而下降，符合预期（越远的 draft 越难猜中）
+- 这解释了 MTP 吞吐是无投机（纯 target）的 1.69–2.18×
 
 ---
 
