@@ -25,21 +25,21 @@ Qwen3.6-27B 是一个 reasoning/thinking 模型，默认会在回答前生成思
 ## benchmark.py 使用
 
 ```bash
-# 默认 thinking 开启（兼容现有行为）
+# 默认 thinking 关闭
 uv run python benchmark.py --label "baseline" --concurrency "1,5,10"
 
-# 关闭 thinking
-uv run python benchmark.py --label "baseline" --concurrency "1,5,10" --disable-thinking
+# 如果需要开启 thinking（调试/对比）
+uv run python benchmark.py --label "baseline" --concurrency "1,5,10" --enable-thinking
 ```
 
 ## 效果验证
 
 ```
-# 默认（thinking 开启）
-content: None | reasoning: "Here's a thinking process..."
-
-# --disable-thinking
+# 默认（thinking 关闭）
 content: "4" | reasoning: (无)
+
+# --enable-thinking
+content: None | reasoning: "Here's a thinking process..."
 ```
 
 ## 参考

@@ -132,12 +132,12 @@ async def run_single_scenario(
     max_tokens: int,
     timeout: int,
     label: str,
-    disable_thinking: bool = False,
+    enable_thinking: bool = False,
 ) -> dict:
     """Run one concurrency scenario. Returns stats dict."""
     # Inject max_tokens into each payload
     scenario_payloads = [{**p, "max_tokens": max_tokens} for p in payloads]
-    if disable_thinking:
+    if not enable_thinking:
         # HuggingFace 官方推荐方式：chat_template_kwargs={"enable_thinking": False}
         scenario_payloads = [
             {**p, "extra_body": {"chat_template_kwargs": {"enable_thinking": False}}}
@@ -322,8 +322,8 @@ async def main():
         help=f"Directory containing prompt_*.txt files (default: {PROMPTS_DIR})",
     )
     parser.add_argument(
-        "--disable-thinking", action="store_true",
-        help="Disable Qwen3 thinking mode via chat_template_kwargs (default: thinking enabled)",
+        "--enable-thinking", action="store_true",
+        help="Enable Qwen3 thinking mode (default: thinking disabled via chat_template_kwargs)",
     )
     args = parser.parse_args()
 
@@ -375,7 +375,7 @@ async def main():
                 max_tokens=args.max_tokens,
                 timeout=args.timeout,
                 label=args.label,
-                disable_thinking=args.disable_thinking,
+                enable_thinking=args.enable_thinking,
             )
             results.append(r)
         except Exception as e:
