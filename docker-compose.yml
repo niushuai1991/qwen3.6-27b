@@ -5,8 +5,8 @@ services:
     environment:
       - NVIDIA_VISIBLE_DEVICES=0
       - HF_HOME=/models/.cache
-    ports:
-      - "0.0.0.0:8000:8000"
+    network_mode: host
+    ipc: host
     volumes:
       - /data/models:/models
       - /data/vllm-logs:/logs

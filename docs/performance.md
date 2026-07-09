@@ -14,6 +14,7 @@
 | k=4 验证 | 2026-07-09 | MTP k=4 | 默认参数 | 36.8 | 崩溃 | 崩溃 | — | ✗ cudagraph 越界→回退 k=3 |
 | k=5 验证 | 2026-07-09 | MTP k=5 | max-num-seqs=5 | 可跑* | 崩溃 | — | — | ✗ 同 k=4 根因→回退 k=3 |
 | no_mtp | 2026-07-09 | 无投机（纯 target） | 移除 speculative-config | 16.9 | 97.1 | 182.7 | 3.1ms | 0.59× ✗ 全面劣于 MTP→回退 k=3 |
+| 容器优化 | 2026-07-09 | MTP k=3 | host 网络 + ipc host | 36.6 | 171.8 | 310.1 | N/A | ≈基线（+0.1~1.1% 噪声内）✗ 裸机无意义 |
 | Stage B | — | DSparkLite k=7 | 优化参数 | — | — | — | — | — |
 | Stage C | — | DSpark Trained k=7 | 优化参数 | — | — | — | — | — |
 
@@ -194,3 +195,45 @@ c≥5 错误：`EngineDeadError` → `torch.AcceleratorError: CUDA error: an ill
 2. **提升随并发递减（2.18× → 1.69×）**：c=1 时纯串行 decode 最慢，MTP acceptance 收益最大；c=10 时无投机也能 batch 并行共享算力，且无投机 KV cache 更大（228k vs 137k，+66%，可容纳更多并发序列），缩小差距。
 3. **TPOT 反直觉但不影响结论**：无 MTP c=10 TPOT 3.1ms < MTP 3.9ms（单步只算 1 token，无 draft verify 开销），但总吞吐仍输给 MTP——MTP 每步产出更多 token 抵消了 verify 开销。
 4. **结论**：MTP k=3 是单 L40S + 27B 的正确选择，带来 1.69-2.18× 实测吞吐增益。回退 k=3 baseline。
+
+---
+
+## 容器优化验证（host 网络 + ipc host，结论：无实质提升，裸机无意义）
+
+**目标**：验证「直接在宿主机装 vLLM（裸机）是否比容器快」的假设。**结论：host 网络 + ipc host 优化对吞吐无实质影响（+0.1~1.1%，benchmark 噪声内），证明容器已等价于裸机，无需裸机部署。**
+
+### 背景
+
+容器理论上对 GPU 推理零开销（`runtime: nvidia` 直通 GPU + bind mount 模型权重走宿主机磁盘）。容器仅有的微小开销点是：① 网络桥接 NAT（`ports` 映射 vs host 网络）；② 默认 `/dev/shm` 64MB 限制（vs `ipc: host` 共享宿主机 shm）。
+
+为验证这两点是否影响吞吐，给容器加 `network_mode: host` + `ipc: host`（vLLM 官方推荐高性能配置，使容器的 CPU/网络/shm 层面等价于裸机），重跑 benchmark 对比。若此优化无提升，则裸机（再省掉容器层）必然也无意义——因为 GPU 本就直通。
+
+### 配置变更
+
+`docker-compose.yml`：
+- 移除 `ports: ["0.0.0.0:8000:8000"]`（host 网络下端口映射冲突）
+- 新增 `network_mode: host`（容器直接用宿主机网络栈，benchmark localhost 走内核 loopback，不经 docker 桥接 NAT/docker-proxy）
+- 新增 `ipc: host`（共享宿主机 `/dev/shm` + IPC namespace，消除 torch worker 间共享内存的 64MB 容器限制；与 `shm_size` 互斥）
+
+vLLM 启动参数与 baseline 完全相同。
+
+### 测试数据
+
+| 配置 | c=1 | c=5 | c=10 | 显存 | 失败 |
+|------|:---:|:---:|:---:|:---:|:---:|
+| MTP k=3 baseline（端口映射） | 36.3 | 170.0 | 309.8 | ~38.8/46 | 0 |
+| host_net（host 网络 + ipc host） | 36.6 | 171.8 | 310.1 | 38.8/46 | 0 |
+| **变化** | +0.8% | +1.1% | +0.1% | 一致 | — |
+
+报告：[`benchmark-host_net.md`](benchmark-host_net.md)（0 失败）。
+
+### 根因分析
+
+1. **GPU 本就直通**：`runtime: nvidia` 下 CUDA kernel、显存、算力全部直接走宿主机 GPU，推理瓶颈（GPU 算力 + 显存带宽）在容器内外物理相同——这是吞吐无差异的根本原因。
+2. **模型走 bind mount**：`/data/models:/models` 直接读宿主机磁盘，无 overlay2 存储驱动开销，模型加载 I/O 无差异。
+3. **网络/shm 非瓶颈**：vLLM 是 GPU-bound，单次生成耗时数十秒由 GPU decode 主导，网络桥接（μs 级）与 shm 在总耗时占比可忽略。
+4. **波动属噪声**：+0.1~1.1% 落在 benchmark 运行间正常波动内（baseline 自身两次跑即为 36.3 vs 36.8），无统计意义。
+
+### 决策
+
+**host_net 配置保留**（vLLM 官方推荐、无副作用、略优）。更重要的是：**裸机部署（直接在服务器装 vLLM）已被证明无意义**——`network_mode: host` + `ipc: host` 让容器在 CPU/网络/shm 层面等价于裸机，而 GPU 本就直通，故容器 = 裸机（性能上）。无需花 30-60min 在宿主机装 vLLM 环境。
