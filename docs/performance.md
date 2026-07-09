@@ -13,6 +13,7 @@
 | Stage A | 2026-07-08 | DFlash k=3（最佳） | baseline 参数 | 35.2 | 162.3 | 219.9 | 3.7ms | 0.71× ✗ 不适用→回退 |
 | k=4 验证 | 2026-07-09 | MTP k=4 | 默认参数 | 36.8 | 崩溃 | 崩溃 | — | ✗ cudagraph 越界→回退 k=3 |
 | k=5 验证 | 2026-07-09 | MTP k=5 | max-num-seqs=5 | 可跑* | 崩溃 | — | — | ✗ 同 k=4 根因→回退 k=3 |
+| no_mtp | 2026-07-09 | 无投机（纯 target） | 移除 speculative-config | 16.9 | 97.1 | 182.7 | 3.1ms | 0.59× ✗ 全面劣于 MTP→回退 k=3 |
 | Stage B | — | DSparkLite k=7 | 优化参数 | — | — | — | — | — |
 | Stage C | — | DSpark Trained k=7 | 优化参数 | — | — | — | — | — |
 
@@ -170,3 +171,26 @@ c≥5 错误：`EngineDeadError` → `torch.AcceleratorError: CUDA error: an ill
 ### 决策
 
 **回退 MTP k=3 baseline**。k≥4 在单 L40S + vLLM 0.24 配置下：默认崩溃不可用，唯一规避（enforce_eager）稳定但慢且无收益。根因是 vLLM PIECEWISE cudagraph 的 k≥4 边界 bug；待 vLLM 修复 spec-decode FULL cudagraph 支持（或换硬件/版本）后可重试。
+
+---
+
+## 无 MTP 对比验证（结论：MTP 全面占优，确认 k=3 最优）
+
+**目标**：禁用投机解码（移除 `--speculative-config`，纯 target model decode），量化 MTP k=3 的实际增益。**结论：MTP 在所有并发档全面优于无投机（单流 2.18×，高并发 1.69×），确认 MTP k=3 为最优配置。**
+
+### 测试数据
+
+| 配置 | c=1 | c=5 | c=10 | TPOT(c=10) | KV cache tokens |
+|------|:---:|:---:|:---:|:---:|:---:|
+| MTP k=3（baseline） | 36.8 | 169.2 | 309.4 | 3.9ms | 136,953 |
+| 无 MTP（纯 target） | 16.9 | 97.1 | 182.7 | 3.1ms | 228,162 |
+| **MTP 提升** | **2.18×** | **1.74×** | **1.69×** | — | — |
+
+报告：[`benchmark-no_mtp.md`](benchmark-no_mtp.md)（0 失败）。
+
+### 分析
+
+1. **MTP 全面占优**：所有并发档 MTP 吞吐显著高于无投机。MTP 的 acceptance（~2.4）让每 decode step 产出多个 token，直接转化为吞吐收益。
+2. **提升随并发递减（2.18× → 1.69×）**：c=1 时纯串行 decode 最慢，MTP acceptance 收益最大；c=10 时无投机也能 batch 并行共享算力，且无投机 KV cache 更大（228k vs 137k，+66%，可容纳更多并发序列），缩小差距。
+3. **TPOT 反直觉但不影响结论**：无 MTP c=10 TPOT 3.1ms < MTP 3.9ms（单步只算 1 token，无 draft verify 开销），但总吞吐仍输给 MTP——MTP 每步产出更多 token 抵消了 verify 开销。
+4. **结论**：MTP k=3 是单 L40S + 27B 的正确选择，带来 1.69-2.18× 实测吞吐增益。回退 k=3 baseline。
