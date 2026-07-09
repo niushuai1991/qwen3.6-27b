@@ -17,7 +17,10 @@ Requirements:
 import argparse
 import asyncio
 import json
+import re
+import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -32,6 +35,7 @@ DEFAULT_ENDPOINT = "http://localhost:8000/v1"
 DEFAULT_API_KEY = "not-needed"
 DEFAULT_MAX_TOKENS = 2048
 DEFAULT_TIMEOUT = 300
+METRICS_URL = "http://localhost:8000/metrics"
 
 
 def parse_concurrency(raw: str) -> list[int]:
@@ -67,6 +71,59 @@ def load_prompts(prompts_dir: Path) -> list[dict]:
     return payloads
 
 
+def fetch_metrics() -> dict:
+    """Fetch spec decode metrics from vLLM Prometheus endpoint."""
+    try:
+        result = subprocess.run(
+            ["curl", "-s", METRICS_URL],
+            capture_output=True, text=True, timeout=10,
+        )
+        text = result.stdout
+    except Exception as e:
+        print(f"  [WARN] Failed to fetch metrics: {e}")
+        return {}
+
+    metrics = {}
+    patterns = {
+        "accepted_tokens": r'vllm:spec_decode_num_accepted_tokens_total\{[^}]*\} (\S+)',
+        "draft_tokens": r'vllm:spec_decode_num_draft_tokens_total\{[^}]*\} (\S+)',
+        "num_drafts": r'vllm:spec_decode_num_drafts_total\{[^}]*\} (\S+)',
+    }
+    for name, pattern in patterns.items():
+        m = re.search(pattern, text)
+        if m:
+            metrics[name] = float(m.group(1))
+
+    for pos in range(4):  # k=3 → positions 0,1,2
+        m = re.search(
+            rf'vllm:spec_decode_num_accepted_tokens_per_pos_total\{{[^}}]*position="{pos}"[^}}]*\}}\s+(\S+)',
+            text,
+        )
+        if m:
+            metrics[f"accepted_pos_{pos}"] = float(m.group(1))
+
+    return metrics
+
+
+def compute_acceptance(before: dict, after: dict) -> dict:
+    """Compute acceptance rate from before/after metric snapshots."""
+    draft_delta = after.get("draft_tokens", 0) - before.get("draft_tokens", 0)
+    accepted_delta = after.get("accepted_tokens", 0) - before.get("accepted_tokens", 0)
+
+    result = {
+        "draft_tokens": draft_delta,
+        "accepted_tokens": accepted_delta,
+    }
+    result["acceptance_rate"] = accepted_delta / draft_delta if draft_delta > 0 else None
+
+    for pos in range(4):
+        pos_before = before.get(f"accepted_pos_{pos}", 0)
+        pos_after = after.get(f"accepted_pos_{pos}", 0)
+        result[f"accepted_pos_{pos}"] = pos_after - pos_before
+
+    return result
+
+
 async def run_single_scenario(
     endpoint: OpenAICompletionStreamEndpoint,
     payloads: list[dict],
@@ -81,6 +138,8 @@ async def run_single_scenario(
     scenario_payloads = [{**p, "max_tokens": max_tokens} for p in payloads]
 
     print(f"\n  [{label}] clients={clients}, n_requests={n_requests}, max_tokens={max_tokens}")
+    metrics_before = fetch_metrics()
+
     runner = Runner(
         endpoint=endpoint,
         payload=scenario_payloads,
@@ -89,8 +148,12 @@ async def run_single_scenario(
         timeout=timeout,
     )
     result = await runner.run()
-    stats = result.stats
 
+    time.sleep(1)  # let server flush metrics
+    metrics_after = fetch_metrics()
+    acceptance = compute_acceptance(metrics_before, metrics_after)
+
+    stats = result.stats
     return {
         "label": label,
         "clients": clients,
@@ -110,6 +173,8 @@ async def run_single_scenario(
         "input_tokens_avg": stats.get("num_tokens_input-average"),
         "output_tokens_avg": stats.get("num_tokens_output-average"),
         "prompts_used": len(payloads),
+        "acceptance": acceptance,
+        "acceptance_rate": acceptance.get("acceptance_rate"),
     }
 
 
@@ -151,19 +216,23 @@ def generate_report(results: list[dict], label: str, model: str, endpoint: str) 
     lines.append("## Results")
     lines.append("")
     header = ("| Concurrency | Requests | Time(s) | TTFT p50 | TTFT p90 | "
-              "TTLT p50 | TTLT p90 | TPOT mean | Output TPS | RPM | Failed |")
-    sep = ("|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|")
+              "TTLT p50 | TTLT p90 | TPOT mean | Output TPS | Acceptance | RPM | Failed |")
+    sep = ("|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|")
     lines.append(header)
     lines.append(sep)
 
     for r in results:
+        acc = r.get("acceptance_rate")
+        acc_str = f"{acc:.2f}" if acc is not None else "N/A"
         lines.append(
             f"| {r['clients']} | {r['total_requests']} | "
             f"{_fmt(r['total_test_time_s'], '.1f')} | "
             f"{_fmt(r['ttft_p50_s'])}s | {_fmt(r['ttft_p90_s'])}s | "
             f"{_fmt(r['ttlt_p50_s'])}s | {_fmt(r['ttlt_p90_s'])}s | "
             f"{_ms(r['tpot_mean_s'])}ms | "
-            f"{_fmt(r['output_tps'], '.1f')} | {_fmt(r['rpm'], '.1f')} | "
+            f"{_fmt(r['output_tps'], '.1f')} | "
+            f"{acc_str} | "
+            f"{_fmt(r['rpm'], '.1f')} | "
             f"{r['failed_requests']} |"
         )
     lines.append("")
@@ -187,6 +256,16 @@ def generate_report(results: list[dict], label: str, model: str, endpoint: str) 
         lines.append(f"| TPOT mean | {_ms(r['tpot_mean_s'])}ms |")
         lines.append(f"| Output throughput | {_fmt(r['output_tps'], '.1f')} tok/s |")
         lines.append(f"| Request rate | {_fmt(r['rpm'], '.1f')} rpm |")
+
+        # Acceptance breakdown
+        acc = r.get("acceptance", {})
+        acc_rate = r.get("acceptance_rate")
+        acc_rate_str = f"{acc_rate:.2f}" if acc_rate is not None else "N/A"
+        lines.append(f"| **Acceptance rate** | **{acc_rate_str}** |")
+        for pos in range(4):
+            val = acc.get(f"accepted_pos_{pos}", 0)
+            if val > 0:
+                lines.append(f"| Accepted at position {pos} | {val:.0f} |")
         lines.append("")
 
     lines.append("---")
@@ -248,6 +327,14 @@ async def main():
     print(f"  Max tokens: {args.max_tokens}")
     print("=" * 60)
 
+    # Verify metrics endpoint
+    initial = fetch_metrics()
+    if initial:
+        print(f"\n  vLLM metrics available ({METRICS_URL})")
+    else:
+        print(f"\n  [WARN] vLLM metrics not available. Acceptance data will be N/A.")
+        print(f"  Ensure --enable-metrics is set, or check {METRICS_URL}")
+
     # Load prompts
     prompts_dir = Path(args.prompts_dir)
     if not prompts_dir.exists():
@@ -304,12 +391,16 @@ async def main():
     print(f"\n{'=' * 60}")
     print(f"  Summary: {args.label}")
     print(f"{'=' * 60}")
+    print(f"  {'conc':>4}  {'output_tps':>10}  {'TPOT':>7}  {'Acceptance':>10}  {'failed':>6}")
+    print(f"  {'-'*4}  {'-'*10}  {'-'*7}  {'-'*10}  {'-'*6}")
     for r in results:
-        print(f"  concurrency={r['clients']:>3}:  "
-              f"output_tps={_fmt(r['output_tps'], '.1f'):>8}  "
-              f"TTFT_p50={_fmt(r['ttft_p50_s']):>6}s  "
-              f"TPOT_mean={_ms(r['tpot_mean_s']):>6}ms  "
-              f"failed={r['failed_requests']}")
+        acc = r.get("acceptance_rate")
+        acc_str = f"{acc:.2f}" if acc is not None else "N/A"
+        print(f"  {r['clients']:>4}  "
+              f"{_fmt(r['output_tps'], '.1f'):>10}  "
+              f"{_ms(r['tpot_mean_s']):>7}ms  "
+              f"{acc_str:>10}  "
+              f"{r['failed_requests']:>6}")
 
 
 if __name__ == "__main__":
