@@ -100,18 +100,18 @@ ModuleNotFoundError: xxhash is required for the 'xxhash' prefix caching hash alg
 | `--enable-flashinfer-autotune` | 非合法 CLI 参数（`vllm serve --help` 无）；日志 `kernel_config` 显示 `enable_flashinfer_autotune=True` 是内部默认值，**默认已开启** |
 | `--gpu-memory-utilization` | 保持 0.90（约束 ≤0.90；显存无压力） |
 
-### `--max-num-batched-tokens` 8192 → 16384（唯一实质变更，已测）
+### `--max-num-batched-tokens` 8192 → 16384（唯一实质变更，已测，2026-07-09 thinking 关闭重测）
 
 | 并发 | 8192(baseline) | 16384 | 变化 |
 |:---:|:---:|:---:|:---:|
-| output_tps c=1 | 36.8 | 35.9 | 持平 |
-| output_tps c=5 | 169.2 | 169.9 | 持平 |
-| output_tps c=10 | 309.4 | 307.8 | −0.5%（误差内） |
-| c=10 TTFT p50 | 56.7s | 63.8s | **+12.5%（恶化）** |
+| output_tps c=1 | 37.8 | 37.6 | −0.5% |
+| output_tps c=5 | 172.1 | 174.2 | +1.2% |
+| output_tps c=10 | 317.0 | 317.4 | +0.1% |
+| c=10 TTFT p50 | 0.32s | 0.32s | **无差异** |
 
 报告：[`benchmark-mtp_k3_batched16384.md`](benchmark-mtp_k3_batched16384.md) · [`benchmark-mtp_k3_verify_no_xxhash.md`](benchmark-mtp_k3_verify_no_xxhash.md)
 
-**结论**：16384 无吞吐收益，反而轻微恶化 c=10 TTFT（更大 prefill batch 阻塞 decode）。**回退到 8192。**
+**结论**：16384 无吞吐收益，TTFT 也无差异（旧数据 56.7s→63.8s 的 +12.5% 是 thinking tokens 导致的噪声，关闭 thinking 后两个配置 TTFT 完全一致）。**保持 8192。**
 
 ### Stage 0 总结
 
