@@ -12,6 +12,7 @@
 | Stage 0 | 2026-07-08 | MTP k=3 | 默认(已验证最优) | 36.8 | 169.2 | 309.4 | 3.9ms | ≈基线 |
 | Stage A | 2026-07-08 | DFlash k=3（最佳） | baseline 参数 | 35.2 | 162.3 | 219.9 | 3.7ms | 0.71× ✗ 不适用→回退 |
 | k=4 验证 | 2026-07-09 | MTP k=4 | 默认参数 | 36.8 | 崩溃 | 崩溃 | — | ✗ cudagraph 越界→回退 k=3 |
+| k=5 验证 | 2026-07-09 | MTP k=5 | max-num-seqs=5 | 可跑* | 崩溃 | — | — | ✗ 同 k=4 根因→回退 k=3 |
 | Stage B | — | DSparkLite k=7 | 优化参数 | — | — | — | — | — |
 | Stage C | — | DSpark Trained k=7 | 优化参数 | — | — | — | — | — |
 
@@ -135,28 +136,37 @@ DFlash 论文（2-3× over Eagle-3）优势在大模型 + 充足算力，drafter
 
 ---
 
-## MTP k=4 验证（结论：cudagraph 越界崩溃，不适用，回退 k=3）
+## MTP k≥4 验证（PIECEWISE cudagraph 崩溃，不适用，回退 k=3）
 
-**目标**：尝试增大 MTP 投机深度 k=3→4，看能否提升吞吐。**结论：k=4 默认配置在并发 ≥5 时 CUDA 崩溃；enforce_eager 可稳定但比 k=3 慢 25-46%，且 c=1 零收益。回退 k=3。**
+**目标**：增大 MTP 投机深度 k=3→4/5，看能否提升吞吐。**结论：k≥4 在并发 ≥5 时必触发 `cudaErrorIllegalAddress` 崩溃；根因是 vLLM 0.24 PIECEWISE cudagraph 在 spec-decode 下的越界 bug，与显存、max-num-seqs 均无关。唯一规避（enforce_eager）比 k=3 慢且无收益。回退 k=3。**
 
 ### 测试数据
 
-| 配置 | c=1 | c=5 | c=10 | 说明 |
-|------|:---:|:---:|:---:|------|
-| MTP k=3（baseline） | 36.8 | 169.2 | 309.4 | 0 失败 |
-| MTP k=4（默认 cudagraph） | 36.8 | **崩溃** | **崩溃** | c≥5 全部 500 |
-| MTP k=4（enforce_eager） | ~27.4 | ~91 | — | 稳定但慢 |
+| 配置 | max-num-seqs | c=1 | c=5 | c=10 | 说明 |
+|------|:---:|:---:|:---:|:---:|------|
+| MTP k=3（baseline） | 10 | 36.8 | 169.2 | 309.4 | 0 失败 |
+| MTP k=4（默认 cudagraph） | 10 | 36.8 | **崩溃** | **崩溃** | c≥5 全 500 |
+| MTP k=4（enforce_eager） | 10 | ~27.4 | ~91 | — | 稳定但慢 25-46% |
+| MTP k=5（默认 cudagraph） | 5 | 可跑* | **崩溃** | — | c=5 全 500（10.6s 同时返回） |
 
-c=5/10 错误：`EngineDeadError` → `torch.AcceleratorError: CUDA error: an illegal memory access was encountered (cudaErrorIllegalAddress)`。报告：[`benchmark-mtp_k4.md`](benchmark-mtp_k4.md)（仅 c=1 完整，c=5/10 全失败）。
+\* k=5 c=1 warmup http=200（单序列不崩）；完整 benchmark 未跑（c≥5 必崩）。
 
-### 根因分析（cudagraph replay 越界，非显存）
+c≥5 错误：`EngineDeadError` → `torch.AcceleratorError: CUDA error: an illegal memory access was encountered (cudaErrorIllegalAddress)`。报告：[`benchmark-mtp_k4.md`](benchmark-mtp_k4.md)（k=4 仅 c=1 完整，c=5/10 全失败）。
+
+### 根因分析（cudagraph replay 越界，非显存、非 max-num-seqs）
 
 1. **错误类型**：`cudaErrorIllegalAddress`（非法内存访问），不是 OOM（OOM 会报 `out of memory`）。崩溃点 `gpu_model_runner.py:3767 synchronize_input_prep`（异步报告，真实越界 kernel 更早）。
-2. **排除显存**：崩溃瞬间显存峰值仅 **40.2 / 46 GB**（余量 ~5.8GB），远未触顶。
-3. **enforce_eager 验证（决定性）**：关闭 cudagraph + torch.compile 后，k=4 在 c=5 全部 http=200 稳定 → 根因 = **cudagraph replay 越界**，非 draft 逻辑 bug。
-4. **机制**：vLLM 0.24 的 spec-decode + FlashInfer 不支持 FULL cudagraph（日志 `AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE`），自动降级 PIECEWISE；k=4（每序列 5 候选 token）在并发 batch 下 PIECEWISE graph shape 与实际 spec-decode batch 不匹配，replay 时越界。k=3（每序列 4 候选）落在稳定 capture size，不触发。
-5. **c=1 零收益**：k=4 c=1 output_tps=36.8 = k=3，说明增大 k 未提升 accepted length / TPOT（MTP 单流吞吐由 acceptance 决定，k=3 已接近该模型 acceptance 上限）。
+2. **排除显存**：崩溃瞬间显存峰值仅 **40.2 / 46 GB（k=4）/ 38.6 / 46 GB（k=5）**，余量 5.8–7.4 GB，远未触顶。
+3. **enforce_eager 验证（决定性，k=4）**：关闭 cudagraph + torch.compile 后，k=4 c=5 全部 http=200 稳定 → 根因 = **cudagraph replay 越界**，非 draft 逻辑 bug。
+4. **机制**：vLLM 0.24 的 spec-decode + FlashInfer 不支持 FULL cudagraph（日志 `AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE`），自动降级 PIECEWISE；k≥4（每序列 ≥5 候选 token）在并发 batch 下 PIECEWISE graph shape 与实际 spec-decode batch 不匹配，replay 时越界。k=3（每序列 4 候选）落在稳定 capture size，不触发。
+5. **max-num-seqs=5 不能规避（k=5 实验证伪）**：缩小 max-num-seqs 只缩小 cudagraph capture range（k=5 时 `[1,2,4,8,16,24,32,40,48,56]`，max 56），但 **PIECEWISE 降级依然触发**（启动警告同 k=4），c=5 仍崩溃。根因在 PIECEWISE + k≥4 的 shape 越界，与并发上限无关。
+6. **c=1 零收益**：k=4 c=1 output_tps=36.8 = k=3，说明增大 k 未提升 accepted length / TPOT（MTP 单流吞吐由 acceptance 决定，k=3 已接近该模型 acceptance 上限）。
+
+### 规避方法与代价
+
+- **唯一规避**：`--enforce-eager`（关 cudagraph + torch.compile）。代价：k=4 下 c=1 ~27.4 / c=5 ~91 tok/s，比 k=3 baseline 慢 **25–46%**，且 c=1 零收益。得不偿失。
+- **不可行**：降 max-num-seqs、换 k 值（k=4/5 均崩）均无效。
 
 ### 决策
 
-**回退 MTP k=3 baseline**。k=4 在单 L40S 配置下：默认崩溃不可用，enforce_eager 稳定但慢（关 cudagraph 代价）且无收益。进一步增大 k 在该硬件/模型上无前景，且 k≥4 触发 vLLM PIECEWISE cudagraph 边界 bug。
+**回退 MTP k=3 baseline**。k≥4 在单 L40S + vLLM 0.24 配置下：默认崩溃不可用，唯一规避（enforce_eager）稳定但慢且无收益。根因是 vLLM PIECEWISE cudagraph 的 k≥4 边界 bug；待 vLLM 修复 spec-decode FULL cudagraph 支持（或换硬件/版本）后可重试。
