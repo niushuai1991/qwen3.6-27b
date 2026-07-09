@@ -11,6 +11,7 @@
 | **Baseline** | 2026-07-08 | MTP k=3 | 默认参数 | 36.3 | 170.0 | 309.8 | 6.4ms | — |
 | Stage 0 | 2026-07-08 | MTP k=3 | 默认(已验证最优) | 36.8 | 169.2 | 309.4 | 3.9ms | ≈基线 |
 | Stage A | 2026-07-08 | DFlash k=3（最佳） | baseline 参数 | 35.2 | 162.3 | 219.9 | 3.7ms | 0.71× ✗ 不适用→回退 |
+| k=4 验证 | 2026-07-09 | MTP k=4 | 默认参数 | 36.8 | 崩溃 | 崩溃 | — | ✗ cudagraph 越界→回退 k=3 |
 | Stage B | — | DSparkLite k=7 | 优化参数 | — | — | — | — | — |
 | Stage C | — | DSpark Trained k=7 | 优化参数 | — | — | — | — | — |
 
@@ -131,3 +132,31 @@ DFlash 论文（2-3× over Eagle-3）优势在大模型 + 充足算力，drafter
 ### 决策
 
 **回退 MTP k=3 baseline**（Stage 0 已验证最优）。DFlash drafter 模型保留在 `/data/models/Qwen3.6-27B-DFlash`（3.3GB），供未来换硬件（多卡/更强 GPU）复用。Stage B（DSparkLite custom_class）依赖 DFlash drafter，同样不适用；Stage C（DeepSpec 训练）受架构/显存/存储多重阻塞，当前硬件不可行。DSpark 路线在单 L40S + 27B 配置下暂止于 MTP baseline。
+
+---
+
+## MTP k=4 验证（结论：cudagraph 越界崩溃，不适用，回退 k=3）
+
+**目标**：尝试增大 MTP 投机深度 k=3→4，看能否提升吞吐。**结论：k=4 默认配置在并发 ≥5 时 CUDA 崩溃；enforce_eager 可稳定但比 k=3 慢 25-46%，且 c=1 零收益。回退 k=3。**
+
+### 测试数据
+
+| 配置 | c=1 | c=5 | c=10 | 说明 |
+|------|:---:|:---:|:---:|------|
+| MTP k=3（baseline） | 36.8 | 169.2 | 309.4 | 0 失败 |
+| MTP k=4（默认 cudagraph） | 36.8 | **崩溃** | **崩溃** | c≥5 全部 500 |
+| MTP k=4（enforce_eager） | ~27.4 | ~91 | — | 稳定但慢 |
+
+c=5/10 错误：`EngineDeadError` → `torch.AcceleratorError: CUDA error: an illegal memory access was encountered (cudaErrorIllegalAddress)`。报告：[`benchmark-mtp_k4.md`](benchmark-mtp_k4.md)（仅 c=1 完整，c=5/10 全失败）。
+
+### 根因分析（cudagraph replay 越界，非显存）
+
+1. **错误类型**：`cudaErrorIllegalAddress`（非法内存访问），不是 OOM（OOM 会报 `out of memory`）。崩溃点 `gpu_model_runner.py:3767 synchronize_input_prep`（异步报告，真实越界 kernel 更早）。
+2. **排除显存**：崩溃瞬间显存峰值仅 **40.2 / 46 GB**（余量 ~5.8GB），远未触顶。
+3. **enforce_eager 验证（决定性）**：关闭 cudagraph + torch.compile 后，k=4 在 c=5 全部 http=200 稳定 → 根因 = **cudagraph replay 越界**，非 draft 逻辑 bug。
+4. **机制**：vLLM 0.24 的 spec-decode + FlashInfer 不支持 FULL cudagraph（日志 `AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE`），自动降级 PIECEWISE；k=4（每序列 5 候选 token）在并发 batch 下 PIECEWISE graph shape 与实际 spec-decode batch 不匹配，replay 时越界。k=3（每序列 4 候选）落在稳定 capture size，不触发。
+5. **c=1 零收益**：k=4 c=1 output_tps=36.8 = k=3，说明增大 k 未提升 accepted length / TPOT（MTP 单流吞吐由 acceptance 决定，k=3 已接近该模型 acceptance 上限）。
+
+### 决策
+
+**回退 MTP k=3 baseline**。k=4 在单 L40S 配置下：默认崩溃不可用，enforce_eager 稳定但慢（关 cudagraph 代价）且无收益。进一步增大 k 在该硬件/模型上无前景，且 k≥4 触发 vLLM PIECEWISE cudagraph 边界 bug。
