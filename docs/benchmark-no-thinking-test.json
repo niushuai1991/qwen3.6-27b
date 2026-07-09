@@ -1,0 +1,32 @@
+[
+  {
+    "label": "no-thinking-test",
+    "clients": 1,
+    "n_requests": 3,
+    "max_tokens": 512,
+    "total_requests": 3,
+    "total_test_time_s": 44.0625305249996,
+    "ttft_p50_s": 0.2141998579900246,
+    "ttft_p90_s": 0.7180712916131597,
+    "ttlt_p50_s": 15.07552284799749,
+    "ttlt_p90_s": 16.492986081598794,
+    "tpot_p50_s": 0.029086171146771558,
+    "tpot_mean_s": 0.028108806928243232,
+    "output_tps": 34.86809158058852,
+    "rpm": 6.212317548547708,
+    "failed_requests": 0,
+    "input_tokens_avg": 142.66666666666666,
+    "output_tokens_avg": 512,
+    "prompts_used": 5,
+    "acceptance": {
+      "draft_tokens": 1875.0,
+      "accepted_tokens": 912.0,
+      "acceptance_rate": 0.4864,
+      "accepted_pos_0": 439.0,
+      "accepted_pos_1": 293.0,
+      "accepted_pos_2": 180.0,
+      "accepted_pos_3": 0
+    },
+    "acceptance_rate": 0.4864
+  }
+]

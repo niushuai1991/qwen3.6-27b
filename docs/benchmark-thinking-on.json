@@ -1,0 +1,32 @@
+[
+  {
+    "label": "thinking-on",
+    "clients": 1,
+    "n_requests": 3,
+    "max_tokens": 512,
+    "total_requests": 3,
+    "total_test_time_s": 35.73632252900279,
+    "ttft_p50_s": null,
+    "ttft_p90_s": null,
+    "ttlt_p50_s": 12.111909738989198,
+    "ttlt_p90_s": 12.358323302204372,
+    "tpot_p50_s": null,
+    "tpot_mean_s": null,
+    "output_tps": 42.991342058709826,
+    "rpm": 7.622223626216994,
+    "failed_requests": 0,
+    "input_tokens_avg": 140.66666666666666,
+    "output_tokens_avg": 512,
+    "prompts_used": 5,
+    "acceptance": {
+      "draft_tokens": 1509.0,
+      "accepted_tokens": 1035.0,
+      "acceptance_rate": 0.6858846918489065,
+      "accepted_pos_0": 425.0,
+      "accepted_pos_1": 342.0,
+      "accepted_pos_2": 268.0,
+      "accepted_pos_3": 0
+    },
+    "acceptance_rate": 0.6858846918489065
+  }
+]
