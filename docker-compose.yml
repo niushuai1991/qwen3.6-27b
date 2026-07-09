@@ -5,6 +5,7 @@ services:
     environment:
       - NVIDIA_VISIBLE_DEVICES=0
       - HF_HOME=/models/.cache
+      - TZ=Asia/Shanghai
     network_mode: host
     ipc: host
     volumes:
