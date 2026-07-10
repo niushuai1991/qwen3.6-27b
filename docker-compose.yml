@@ -15,7 +15,7 @@ services:
       /models/Qwen3.6-27B-FP8
       --served-model-name qwen3.6-27b
       --host 0.0.0.0
-      --port 8000
+      --port 18001
       --trust-remote-code
       --dtype auto
       --kv-cache-dtype fp8_e4m3
@@ -37,7 +37,7 @@ services:
               capabilities: [gpu]
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:18001/health"]
       interval: 30s
       timeout: 10s
       retries: 3

@@ -8,12 +8,67 @@ Qwen3.6-27B 是一个 reasoning/thinking 模型，默认会在回答前生成思
 
 经 2026-07-09 实测（vLLM 0.24.0），两种客户端参数可关闭 thinking：
 
-| 方式 | curl 请求体 | OpenAI SDK |
-|------|------------|------------|
-| `chat_template_kwargs` | `{"chat_template_kwargs": {"enable_thinking": false}}` | `extra_body={"chat_template_kwargs": {"enable_thinking": false}}` |
-| `reasoning_effort` | `{"reasoning_effort": "none"}` | `extra_body={"reasoning_effort": "none"}` |
+### 方式 1: `chat_template_kwargs`（HuggingFace 官方推荐，本项目使用）
 
-本项目使用 `chat_template_kwargs` 方式（HuggingFace 官方推荐）。
+**curl:**
+
+```bash
+curl -s http://localhost:18001/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen/Qwen3.6-27B-FP8",
+    "messages": [{"role": "user", "content": "What is 2+2?"}],
+    "max_tokens": 100,
+    "chat_template_kwargs": {"enable_thinking": false}
+  }'
+```
+
+**OpenAI SDK:**
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:18001/v1", api_key="not-needed")
+
+response = client.chat.completions.create(
+    model="Qwen/Qwen3.6-27B-FP8",
+    messages=[{"role": "user", "content": "What is 2+2?"}],
+    max_tokens=100,
+    extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+)
+print(response.choices[0].message.content)
+```
+
+### 方式 2: `reasoning_effort`（OpenAI 兼容参数）
+
+**curl:**
+
+```bash
+curl -s http://localhost:18001/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen/Qwen3.6-27B-FP8",
+    "messages": [{"role": "user", "content": "What is 2+2?"}],
+    "max_tokens": 100,
+    "reasoning_effort": "none"
+  }'
+```
+
+**OpenAI SDK:**
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:18001/v1", api_key="not-needed")
+
+response = client.chat.completions.create(
+    model="Qwen/Qwen3.6-27B-FP8",
+    messages=[{"role": "user", "content": "What is 2+2?"}],
+    max_tokens=100,
+    extra_body={"reasoning_effort": "none"},
+)
+print(response.choices[0].message.content)
+```
 
 ## 误区
 
