@@ -16,7 +16,7 @@ Qwen3.6-27B 是一个 reasoning/thinking 模型，默认会在回答前生成思
 curl -s http://localhost:18001/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "Qwen/Qwen3.6-27B-FP8",
+    "model": "qwen3.6-27b",
     "messages": [{"role": "user", "content": "What is 2+2?"}],
     "max_tokens": 100,
     "chat_template_kwargs": {"enable_thinking": false}
@@ -31,7 +31,7 @@ from openai import OpenAI
 client = OpenAI(base_url="http://localhost:18001/v1", api_key="not-needed")
 
 response = client.chat.completions.create(
-    model="Qwen/Qwen3.6-27B-FP8",
+    model="qwen3.6-27b",
     messages=[{"role": "user", "content": "What is 2+2?"}],
     max_tokens=100,
     extra_body={"chat_template_kwargs": {"enable_thinking": False}},
@@ -47,7 +47,7 @@ print(response.choices[0].message.content)
 curl -s http://localhost:18001/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "Qwen/Qwen3.6-27B-FP8",
+    "model": "qwen3.6-27b",
     "messages": [{"role": "user", "content": "What is 2+2?"}],
     "max_tokens": 100,
     "reasoning_effort": "none"
@@ -62,7 +62,7 @@ from openai import OpenAI
 client = OpenAI(base_url="http://localhost:18001/v1", api_key="not-needed")
 
 response = client.chat.completions.create(
-    model="Qwen/Qwen3.6-27B-FP8",
+    model="qwen3.6-27b",
     messages=[{"role": "user", "content": "What is 2+2?"}],
     max_tokens=100,
     extra_body={"reasoning_effort": "none"},
