@@ -71,7 +71,7 @@ docker compose logs -f                       # 查看日志
 docker compose down                          # 停止
 
 # 健康检查
-curl -s http://localhost:8000/health         # 服务状态
+curl -s http://localhost:18001/health         # 服务状态
 nvidia-smi --query-gpu=memory.used --format=csv  # 显存使用
 
 # 基准测试
