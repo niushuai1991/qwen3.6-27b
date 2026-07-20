@@ -1,17 +1,21 @@
-"""Benchmark local vLLM deployment with llmeter and generate a report.
+"""Benchmark local vLLM deployment with a native streaming client.
+
+计时口径与 measure_latency.py 同源：客户端 streaming，逐 SSE chunk 记录首/末 content
+token 时间戳，产出 TTFT（≈prefill）与 decode 阶段吞吐 decode_tok_s。
+
+    TTFT            = first_content_chunk_t - start_t
+    TTLT            = last_content_chunk_t  - start_t
+    decode_per_token = (TTLT - TTFT) / (content_tokens - 1)
+    decode_tok_s     = (content_tokens - 1) / (TTLT - TTFT)   # decode 阶段有效吞吐（不含 prefill）
+    output_tps       = Σ content_tokens / total_test_time      # 整体聚合（含 TTFT），对齐 llmeter 历史
+
+content_tokens 来自末 chunk 的 usage（stream_options.include_usage），减去 reasoning_tokens。
 
 Usage:
-    # Baseline (MTP)
-    uv run python benchmark.py --label "mtp_k3" --concurrency 1,5,10
-
-    # Stage A (DFlash)
-    uv run python benchmark.py --label "dflash_k7" --concurrency 1,5,10
-
-    # Compare against baseline
-    uv run python benchmark.py --label "dflash_k10" --concurrency 1,5,10,20
+    uv run python benchmark.py --label "mtp_k3_native" --concurrency 1,5,10
 
 Requirements:
-    pip install llmeter
+    pip install httpx
 """
 
 import argparse
@@ -24,18 +28,17 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from llmeter.endpoints.openai import OpenAICompletionStreamEndpoint
-from llmeter.runner import Runner
+import httpx
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 PROMPTS_DIR = PROJECT_ROOT / "prompts"
 DOCS_DIR = PROJECT_ROOT / "docs"
 DEFAULT_MODEL = "qwen3.6-27b"
-DEFAULT_ENDPOINT = "http://localhost:8000/v1"
+DEFAULT_ENDPOINT = "http://localhost:18001/v1"
 DEFAULT_API_KEY = "not-needed"
 DEFAULT_MAX_TOKENS = 2048
 DEFAULT_TIMEOUT = 300
-METRICS_URL = "http://localhost:8000/metrics"
+METRICS_URL = "http://localhost:18001/metrics"
 
 
 def parse_concurrency(raw: str) -> list[int]:
@@ -44,17 +47,15 @@ def parse_concurrency(raw: str) -> list[int]:
 
 
 def load_prompts(prompts_dir: Path) -> list[dict]:
-    """Load prompt_*.txt files, return list of OpenAI chat payloads."""
+    """Load prompt_*.txt files, return list of {messages, max_tokens} dicts."""
     pattern = "prompt_*.txt"
     prompt_files = sorted(prompts_dir.glob(pattern))
     if not prompt_files:
-        # Also try prompt_N.txt pattern
         prompt_files = sorted(prompts_dir.glob("prompt_*"))
         prompt_files = [f for f in prompt_files if f.suffix == ".txt"]
 
     if not prompt_files:
         print(f"  No prompt files found matching {pattern} in {prompts_dir}")
-        # Use a default simple prompt
         return [{"messages": [{"role": "user", "content": "Explain what machine learning is in 3 paragraphs."}],
                  "max_tokens": 512}]
 
@@ -124,8 +125,96 @@ def compute_acceptance(before: dict, after: dict) -> dict:
     return result
 
 
+async def stream_one(client: httpx.AsyncClient, url: str, payload: dict, timeout: int) -> dict:
+    """Single streaming request with per-token timing (measure_latency methodology).
+
+    Records first/last content-chunk timestamps and token counts from the final
+    chunk's usage. Returns a dict of per-request metrics.
+    """
+    start_t = time.perf_counter()
+    first_t = None
+    last_t = None
+    chunk_content_tokens = 0  # fallback if usage missing
+    usage = None
+    error = None
+    try:
+        async with client.stream("POST", url, json=payload, timeout=timeout) as resp:
+            async for line in resp.aiter_lines():
+                if not line or not line.startswith("data: "):
+                    continue
+                data = line[6:]
+                if data.strip() == "[DONE]":
+                    break
+                try:
+                    obj = json.loads(data)
+                except Exception:
+                    continue
+                if obj.get("usage"):
+                    usage = obj["usage"]
+                choices = obj.get("choices") or []
+                if choices:
+                    delta = choices[0].get("delta", {}) or {}
+                    if delta.get("content"):
+                        now = time.perf_counter()
+                        if first_t is None:
+                            first_t = now
+                        last_t = now
+                        chunk_content_tokens += 1
+    except Exception as e:
+        error = str(e)
+    end_t = time.perf_counter()
+
+    ctoks = usage.get("completion_tokens") if usage else None
+    cdet = (usage.get("completion_tokens_details") if usage else None) or {}
+    rtoks = cdet.get("reasoning_tokens", 0) or 0
+    content_tokens = (ctoks - rtoks) if ctoks is not None else chunk_content_tokens
+
+    ttft = (first_t - start_t) if first_t is not None else None
+    ttlt = (last_t - start_t) if last_t is not None else None
+    has_decode = (first_t is not None and last_t is not None
+                  and content_tokens is not None and content_tokens > 1)
+    decode_total = (last_t - first_t) if has_decode else None
+    dpt_ms = (decode_total / (content_tokens - 1) * 1000) if has_decode else None
+    dtok_s = ((content_tokens - 1) / decode_total) if (has_decode and decode_total > 0) else None
+
+    return {
+        "ttft_s": ttft,
+        "ttlt_s": ttlt,
+        "decode_total_s": decode_total,
+        "decode_per_token_ms": dpt_ms,
+        "decode_tok_s": dtok_s,
+        "content_tokens": content_tokens,
+        "reasoning_tokens": rtoks,
+        "completion_tokens": ctoks,
+        "prompt_tokens": usage.get("prompt_tokens") if usage else None,
+        "wall_s": end_t - start_t,
+        "error": error,
+    }
+
+
+def _percentile(sorted_xs: list, p: float):
+    """Linear-interpolated percentile of an already-sorted list. p in [0, 100]."""
+    if not sorted_xs:
+        return None
+    if len(sorted_xs) == 1:
+        return sorted_xs[0]
+    k = (len(sorted_xs) - 1) * (p / 100.0)
+    f = int(k)
+    c = min(f + 1, len(sorted_xs) - 1)
+    if f == c:
+        return sorted_xs[f]
+    return sorted_xs[f] + (sorted_xs[c] - sorted_xs[f]) * (k - f)
+
+
+def _mean(xs):
+    xs = [x for x in xs if x is not None]
+    return sum(xs) / len(xs) if xs else None
+
+
 async def run_single_scenario(
-    endpoint: OpenAICompletionStreamEndpoint,
+    endpoint: str,
+    api_key: str,
+    model: str,
     payloads: list[dict],
     clients: int,
     n_requests: int,
@@ -134,54 +223,81 @@ async def run_single_scenario(
     label: str,
     enable_thinking: bool = False,
 ) -> dict:
-    """Run one concurrency scenario. Returns stats dict."""
-    # Inject max_tokens into each payload
-    scenario_payloads = [{**p, "max_tokens": max_tokens} for p in payloads]
-    if not enable_thinking:
-        # HuggingFace 官方推荐方式：chat_template_kwargs={"enable_thinking": False}
-        scenario_payloads = [
-            {**p, "extra_body": {"chat_template_kwargs": {"enable_thinking": False}}}
-            for p in scenario_payloads
-        ]
+    """Run one concurrency scenario with native streaming client. Returns stats dict."""
+    base = []
+    for p in payloads:
+        bp = {
+            "model": model,
+            "messages": p["messages"],
+            "max_tokens": max_tokens,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
+        if not enable_thinking:
+            bp["reasoning_effort"] = "none"
+        base.append(bp)
+    # round-robin prompts across requests
+    req_payloads = [base[i % len(base)] for i in range(n_requests)]
+
+    url = f"{endpoint.rstrip('/')}/chat/completions"
+    headers = {"Authorization": f"Bearer {api_key}"}
+    sem = asyncio.Semaphore(clients)
 
     print(f"\n  [{label}] clients={clients}, n_requests={n_requests}, max_tokens={max_tokens}")
     metrics_before = fetch_metrics()
 
-    runner = Runner(
-        endpoint=endpoint,
-        payload=scenario_payloads,
-        clients=clients,
-        n_requests=n_requests,
-        timeout=timeout,
-    )
-    result = await runner.run()
+    async with httpx.AsyncClient(headers=headers) as client:
+        async def bounded(i):
+            async with sem:
+                return await stream_one(client, url, req_payloads[i], timeout)
 
-    time.sleep(1)  # let server flush metrics
+        t0 = time.perf_counter()
+        results = await asyncio.gather(*[bounded(i) for i in range(n_requests)])
+        test_time = time.perf_counter() - t0
+
+    await asyncio.sleep(1)  # let server flush metrics
     metrics_after = fetch_metrics()
     acceptance = compute_acceptance(metrics_before, metrics_after)
 
-    stats = result.stats
+    ok = [r for r in results if not r["error"]]
+    failed = len(results) - len(ok)
+
+    def col(key):
+        return sorted([r[key] for r in ok if r.get(key) is not None])
+
+    ttft = col("ttft_s")
+    ttlt = col("ttlt_s")
+    dpt = col("decode_per_token_ms")
+    dtok = col("decode_tok_s")
+    walls = col("wall_s")
+
+    total_content_tokens = sum((r["content_tokens"] or 0) for r in ok)
+    total_completion_tokens = sum((r["completion_tokens"] or 0) for r in ok)
+    total_prompt_tokens = sum((r["prompt_tokens"] or 0) for r in ok)
+    output_tps = (total_content_tokens / test_time) if test_time > 0 else None
+
     return {
         "label": label,
         "clients": clients,
         "n_requests": n_requests,
         "max_tokens": max_tokens,
-        "total_requests": result.total_requests,
-        "total_test_time_s": result.total_test_time,
-        "ttft_p50_s": stats.get("time_to_first_token-p50"),
-        "ttft_p90_s": stats.get("time_to_first_token-p90"),
-        "ttlt_p50_s": stats.get("time_to_last_token-p50"),
-        "ttlt_p90_s": stats.get("time_to_last_token-p90"),
-        "tpot_p50_s": stats.get("time_per_output_token-p50"),
-        "tpot_mean_s": stats.get("time_per_output_token-average"),
-        "output_tps": stats.get("output_tps"),
-        "rpm": stats.get("requests_per_minute"),
-        "failed_requests": stats.get("failed_requests", 0),
-        "input_tokens_avg": stats.get("num_tokens_input-average"),
-        "output_tokens_avg": stats.get("num_tokens_output-average"),
-        "prompts_used": len(payloads),
+        "total_requests": n_requests,
+        "failed_requests": failed,
+        "total_test_time_s": test_time,
+        "ttft_p50_s": _percentile(ttft, 50),
+        "ttft_p90_s": _percentile(ttft, 90),
+        "ttlt_p50_s": _percentile(ttlt, 50),
+        "ttlt_p90_s": _percentile(ttlt, 90),
+        "tpot_mean_ms": _mean(dpt),
+        "decode_tok_s_mean": _mean(dtok),
+        "output_tps": output_tps,
+        "input_tokens_avg": (total_prompt_tokens / len(ok)) if ok else None,
+        "output_tokens_avg": (total_completion_tokens / len(ok)) if ok else None,
+        "content_tokens_total": total_content_tokens,
+        "wall_p50_s": _percentile(walls, 50),
         "acceptance": acceptance,
         "acceptance_rate": acceptance.get("acceptance_rate"),
+        "per_request": results,
     }
 
 
@@ -197,11 +313,11 @@ def _fmt(val, template=".3f"):
     return str(val)
 
 
-def _ms(val_s) -> str:
-    """Format seconds as milliseconds string."""
-    if val_s is None:
+def _ms(val_ms) -> str:
+    """Format milliseconds string."""
+    if val_ms is None:
         return "N/A"
-    return f"{val_s * 1000:.1f}"
+    return f"{val_ms:.1f}"
 
 
 def generate_report(results: list[dict], label: str, model: str, endpoint: str) -> str:
@@ -214,19 +330,15 @@ def generate_report(results: list[dict], label: str, model: str, endpoint: str) 
         f"**Date**: {now}",
         f"**Model**: {model}",
         f"**Endpoint**: {endpoint}",
-        f"**Tool**: [awslabs/llmeter](https://github.com/awslabs/llmeter)",
+        f"**Tool**: custom streaming client (measure_latency methodology, httpx)",
         f"**Mode**: streaming",
+        f"**Thinking**: disabled (`reasoning_effort=none`)",
         "",
+        "## Results",
+        "",
+        "| Concurrency | Requests | Time(s) | TTFT p50 | TTFT p90 | TTLT p90 | TPOT mean | decode tok/s | Output TPS | Acceptance | Failed |",
+        "|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|",
     ]
-
-    # Summary table
-    lines.append("## Results")
-    lines.append("")
-    header = ("| Concurrency | Requests | Time(s) | TTFT p50 | TTFT p90 | "
-              "TTLT p50 | TTLT p90 | TPOT mean | Output TPS | Acceptance | RPM | Failed |")
-    sep = ("|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|")
-    lines.append(header)
-    lines.append(sep)
 
     for r in results:
         acc = r.get("acceptance_rate")
@@ -235,11 +347,11 @@ def generate_report(results: list[dict], label: str, model: str, endpoint: str) 
             f"| {r['clients']} | {r['total_requests']} | "
             f"{_fmt(r['total_test_time_s'], '.1f')} | "
             f"{_fmt(r['ttft_p50_s'])}s | {_fmt(r['ttft_p90_s'])}s | "
-            f"{_fmt(r['ttlt_p50_s'])}s | {_fmt(r['ttlt_p90_s'])}s | "
-            f"{_ms(r['tpot_mean_s'])}ms | "
+            f"{_fmt(r['ttlt_p90_s'])}s | "
+            f"{_ms(r['tpot_mean_ms'])}ms | "
+            f"{_fmt(r['decode_tok_s_mean'], '.1f')} | "
             f"{_fmt(r['output_tps'], '.1f')} | "
             f"{acc_str} | "
-            f"{_fmt(r['rpm'], '.1f')} | "
             f"{r['failed_requests']} |"
         )
     lines.append("")
@@ -251,20 +363,18 @@ def generate_report(results: list[dict], label: str, model: str, endpoint: str) 
         lines.append("| Metric | Value |")
         lines.append("|--------|-------|")
         lines.append(f"| Total requests | {r['total_requests']} |")
-        lines.append(f"| Total time | {_fmt(r['total_test_time_s'], '.2f')}s |")
         lines.append(f"| Failed requests | {r['failed_requests']} |")
+        lines.append(f"| Total time | {_fmt(r['total_test_time_s'], '.2f')}s |")
         lines.append(f"| Avg input tokens | {_fmt(r['input_tokens_avg'], '.0f')} |")
         lines.append(f"| Avg output tokens | {_fmt(r['output_tokens_avg'], '.0f')} |")
         lines.append(f"| TTFT p50 | {_fmt(r['ttft_p50_s'])}s |")
         lines.append(f"| TTFT p90 | {_fmt(r['ttft_p90_s'])}s |")
         lines.append(f"| TTLT p50 | {_fmt(r['ttlt_p50_s'])}s |")
         lines.append(f"| TTLT p90 | {_fmt(r['ttlt_p90_s'])}s |")
-        lines.append(f"| TPOT p50 | {_ms(r['tpot_p50_s'])}ms |")
-        lines.append(f"| TPOT mean | {_ms(r['tpot_mean_s'])}ms |")
-        lines.append(f"| Output throughput | {_fmt(r['output_tps'], '.1f')} tok/s |")
-        lines.append(f"| Request rate | {_fmt(r['rpm'], '.1f')} rpm |")
+        lines.append(f"| TPOT mean (decode per-token) | {_ms(r['tpot_mean_ms'])}ms |")
+        lines.append(f"| **decode tok/s (mean per-request)** | **{_fmt(r['decode_tok_s_mean'], '.1f')}** |")
+        lines.append(f"| Output TPS (aggregate, incl TTFT) | {_fmt(r['output_tps'], '.1f')} tok/s |")
 
-        # Acceptance breakdown
         acc = r.get("acceptance", {})
         acc_rate = r.get("acceptance_rate")
         acc_rate_str = f"{acc_rate:.2f}" if acc_rate is not None else "N/A"
@@ -277,17 +387,23 @@ def generate_report(results: list[dict], label: str, model: str, endpoint: str) 
 
     lines.append("---")
     lines.append(f"*Report generated by benchmark.py --label {label}*")
-
+    lines.append("")
+    lines.append(
+        "> **计时口径**：TTFT = 首 content token 延迟（≈prefill）；"
+        "decode tok/s = (content_tokens−1)/(末−首 token)，即 **decode 阶段有效吞吐（不含 prefill）**，"
+        "与 `measure_latency.py` 同源。"
+        "Output TPS = Σ content_tokens / 总耗时（含 TTFT，整体聚合，对齐 llmeter 历史口径）。"
+    )
     return "\n".join(lines)
 
 
 async def main():
     parser = argparse.ArgumentParser(
-        description="Benchmark local vLLM deployment with llmeter",
+        description="Benchmark local vLLM deployment with native streaming client",
     )
     parser.add_argument(
         "--label", required=True,
-        help="Config label for this run, e.g. 'mtp_k3', 'dflash_k7'. Used in report filename.",
+        help="Config label for this run, e.g. 'mtp_k3_native'. Used in report filename.",
     )
     parser.add_argument(
         "--concurrency", default="1,5,10",
@@ -323,7 +439,7 @@ async def main():
     )
     parser.add_argument(
         "--enable-thinking", action="store_true",
-        help="Enable Qwen3 thinking mode (default: thinking disabled via chat_template_kwargs)",
+        help="Enable Qwen3 thinking mode (default: disabled via reasoning_effort=none)",
     )
     args = parser.parse_args()
 
@@ -354,21 +470,14 @@ async def main():
 
     payloads = load_prompts(prompts_dir)
 
-    # Setup endpoint
-    ep = OpenAICompletionStreamEndpoint(
-        model_id=args.model,
-        endpoint_name=args.label,
-        provider="local-vllm",
-        api_key=args.api_key,
-        base_url=args.endpoint,
-    )
-
     # Run scenarios sequentially
     results = []
     for clients in concurrency_levels:
         try:
             r = await run_single_scenario(
-                endpoint=ep,
+                endpoint=args.endpoint,
+                api_key=args.api_key,
+                model=args.model,
                 payloads=payloads,
                 clients=clients,
                 n_requests=args.n_requests,
@@ -393,26 +502,26 @@ async def main():
     report_path.write_text(report)
     print(f"\n  Report saved to {report_path}")
 
-    # Save raw JSON
+    # Save raw JSON (includes per-request detail)
     json_path = DOCS_DIR / f"benchmark-{args.label}.json"
-    json_results = [{k: v for k, v in r.items()} for r in results]
-    json_path.write_text(json.dumps(json_results, indent=2, ensure_ascii=False, default=str))
+    json_path.write_text(json.dumps(results, indent=2, ensure_ascii=False, default=str))
     print(f"  JSON saved to {json_path}")
 
     # Print summary
     print(f"\n{'=' * 60}")
     print(f"  Summary: {args.label}")
     print(f"{'=' * 60}")
-    print(f"  {'conc':>4}  {'output_tps':>10}  {'TPOT':>7}  {'Acceptance':>10}  {'failed':>6}")
-    print(f"  {'-'*4}  {'-'*10}  {'-'*7}  {'-'*10}  {'-'*6}")
+    print(f"  {'conc':>4}  {'decode/s':>8}  {'TPOT':>7}  {'out_tps':>8}  {'accept':>6}  {'fail':>4}")
+    print(f"  {'-'*4}  {'-'*8}  {'-'*7}  {'-'*8}  {'-'*6}  {'-'*4}")
     for r in results:
         acc = r.get("acceptance_rate")
         acc_str = f"{acc:.2f}" if acc is not None else "N/A"
         print(f"  {r['clients']:>4}  "
-              f"{_fmt(r['output_tps'], '.1f'):>10}  "
-              f"{_ms(r['tpot_mean_s']):>7}ms  "
-              f"{acc_str:>10}  "
-              f"{r['failed_requests']:>6}")
+              f"{_fmt(r['decode_tok_s_mean'], '.1f'):>8}  "
+              f"{_ms(r['tpot_mean_ms']):>7}ms  "
+              f"{_fmt(r['output_tps'], '.1f'):>8}  "
+              f"{acc_str:>6}  "
+              f"{r['failed_requests']:>4}")
 
 
 if __name__ == "__main__":

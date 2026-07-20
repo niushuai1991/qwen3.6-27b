@@ -3,6 +3,7 @@
 > 所有 benchmark 均在 NVIDIA L40S 46GB + Qwen3.6-27B-FP8 + vLLM 0.24.0 上运行。
 > 测试命令: `uv run python benchmark.py --label <label> --concurrency "1,5,10"`
 > 每并发级别 10 requests, max_tokens=2048, streaming mode.
+> **2026-07-20 起 `benchmark.py` 改用原生 streaming 计时**（移除 llmeter 依赖）：主指标改为 decode 阶段吞吐 `decode tok/s = (content_tokens−1)/(TTLT−TTFT)`（不含 prefill），与 `measure_latency.py` 同源；保留 `Output TPS`（含 TTFT 的整体聚合）对齐历史 llmeter 口径。历史 llmeter 报告保留作对比。
 
 ## 性能总览
 
