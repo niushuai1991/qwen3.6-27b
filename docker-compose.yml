@@ -1,6 +1,6 @@
 services:
   vllm:
-    image: vllm/vllm-openai:v0.24.0
+    image: vllm/vllm-openai:v0.25.1
     runtime: nvidia
     environment:
       - NVIDIA_VISIBLE_DEVICES=0
