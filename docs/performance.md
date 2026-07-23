@@ -103,7 +103,7 @@ v0.25.1 结果：output_tps 80.1 / 345.5 / 644.7，TPOT(c=10)=14.1ms，acceptanc
 - 不是显存不足：崩溃时 KV cache usage 约 7.8%（k=4）/ 9.2%（k=5），RTX PRO 6000 稳态显存仍有余量。
 - 不是 DeepGEMM target 路径：v0.25.1 日志仍显示 `qwen3_5_text` 在 Blackwell 上自动回落 CUTLASS。
 - 失败路径与 L40S k≥4 现象一致：FlashInfer + spec decode + PIECEWISE cudagraph 下，attention metadata 构建阶段异步暴露 `cudaErrorIllegalAddress`。
-- 当前部署继续使用 MTP k=3；k≥4 需要等待 vLLM/FlashInfer 对 Qwen3.5 MTP spec-decode 路径修复后再重试。
+- 当前部署继续使用 MTP k=3；k≥4 已列入「主动解决」（见 AGENTS.md「下一步」#1）：根因在 FlashInfer 强制 PIECEWISE cudagraph，待验证切 `--attention-backend FLASH_ATTN`（支持 FULL cudagraph，AEON 同款卡用此跑通）是否绕过 k≥4 越界 bug；`enforce-eager` / PR #46324 已证无效。
 
 ### DFlash 复测（RTX PRO 6000 + vLLM 0.24.0，2026-07-23）
 
@@ -142,7 +142,22 @@ v0.24.0 对 drafter 的混合 sliding/full 注意力处理粗放（无 PR #40898
 
 #### 决策
 
-**回退 MTP k=3 @ v0.25.1**（生产配置不变）。DFlash 在单 RTX PRO 6000 + 27B 配置下确认不适用——硬件升级解决了显存/算力，但 drafter 开销与 acceptance 天花板这两个结构性问题不变。DSpark 路线在当前配置下仍暂止于 MTP baseline；待 PR #40898 合入 + 更强 drafter 模型发布后可重测。
+**回退 MTP k=3 @ v0.25.1**（生产配置不变）。DFlash 在单 RTX PRO 6000 + 27B 配置下确认不适用——硬件升级解决了显存/算力，但 drafter 开销与 acceptance 天花板这两个结构性问题不变。DSpark 路线见下「DSpark 调研」：#40898 已关闭但可不依赖，单卡实测仍输 MTP。
+
+### DSpark 调研（2026-07-23，单卡仍输 MTP，但两条阻塞已解除）
+
+**背景**：DSpark（半自回归 + 置信度调度）直击 DFlash 的 acceptance 短板，vLLM main 已原生支持 `qwen3_dspark`。核查「单卡能否跑通 DSpark」。
+
+**两条旧阻塞均已解除**：
+
+1. **[PR #40898](https://github.com/vllm-project/vllm/issues/40898)（DFlash SWA 支持）已关闭、不会合并——但不依赖它**。`Hikari07jp/DSpark-Qwen3.6-27B-AEON-draft` 在 **vLLM 0.23.0 + 自带两个 patch**（`qwen3_dflash.py` + `llm_base_proposer.py`，独立实现 Markov 半自回归路径）上把 DSpark 跑通；本项目早先「降 0.24.0 能跑 DFlash」亦印证 SWA 报错是 0.25.1 版本问题、非死墙。
+2. **「无 EN/ZH 27B drafter」不成立**。`Qwen3.6-27B-DSpark-FR` 是法语专用、不可用；但 AEON 证明可在 `z-lab/Qwen3.6-27B-DFlash`（本项目已下好）基础上自训：加 rank-256 Markov 头 + on-policy 蒸馏，语料仅 15,936 序列、6000 步收敛，**单卡可训**，recipe 开源（`github.com/hikarioyama/dspark-aeon-27b`）。
+
+**决定性同卡实测**：AEON 在**同款单 RTX PRO 6000** 上（vLLM 0.23.0, K=8, T=1.0, NVFP4 target）测得 DSpark-style 头端到端吞吐仅比 z-lab DFlash **+11.0%**（194.8 vs 175.5 tok/s，accept 0.420 vs 0.342）；按域 chat +8.1% / math +7.1%。结合本项目 DFlash=0.76× MTP → **DSpark≈0.84× MTP，仍输 MTP k=3**。
+
+**根因不变**：单卡 decode 占满 GPU → drafter 无 overlap 空隙 → acceptance 提升只能换回 +11%，远不够把 0.76× 翻到 >1×。多卡 / disaggregation 才是翻转前提。
+
+**决策**：DSpark 在单卡配置下确认仍输 MTP，不自训 drafter 优先；但「能跑通」已无技术阻塞。下一步转向先攻 **MTP k≥4 崩溃**（更便宜的杠杆），自训 drafter 列为次选。详见 AGENTS.md「下一步」。
 
 ---
 

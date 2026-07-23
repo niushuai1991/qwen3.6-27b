@@ -25,3 +25,6 @@ Thumbs.db
 
 # Secrets (API keys etc.)
 .env
+
+# Claude Code local settings (permissions allowlist, not committed)
+.claude/settings.local.json
