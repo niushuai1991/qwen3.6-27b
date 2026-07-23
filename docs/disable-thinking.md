@@ -6,9 +6,44 @@ Qwen3.6-27B 是一个 reasoning/thinking 模型，默认会在回答前生成思
 
 ## 有效方式
 
-经 2026-07-09 实测（vLLM 0.24.0），两种客户端参数可关闭 thinking：
+经 2026-07-09 实测（vLLM 0.24.0），两种客户端参数均可关闭 thinking。**推荐使用 OpenAI 兼容的 `reasoning_effort`（方式 1）**；`chat_template_kwargs` 仍可用但不推荐。
 
-### 方式 1: `chat_template_kwargs`（HuggingFace 官方推荐，本项目使用）
+### 方式 1: `reasoning_effort`（OpenAI 兼容，✅ 推荐）
+
+OpenAI Chat Completions 标准参数，vLLM 原生支持。任意 OpenAI 兼容客户端/SDK 均可直接传，无需 `extra_body` 包装、也不依赖服务端 chat template 实现。
+
+**curl:**
+
+```bash
+curl -s http://localhost:18001/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3.6-27b",
+    "messages": [{"role": "user", "content": "What is 2+2?"}],
+    "max_tokens": 100,
+    "reasoning_effort": "none"
+  }'
+```
+
+**OpenAI SDK:**
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:18001/v1", api_key="not-needed")
+
+response = client.chat.completions.create(
+    model="qwen3.6-27b",
+    messages=[{"role": "user", "content": "What is 2+2?"}],
+    max_tokens=100,
+    reasoning_effort="none",
+)
+print(response.choices[0].message.content)
+```
+
+### 方式 2: `chat_template_kwargs`（HuggingFace/vLLM 专有，⚠️ 不推荐）
+
+> 仅作历史/兼容记录。它与 chat template 的 `enable_thinking` 变量强耦合，SDK 端需经 `extra_body` 透传，可移植性与健壮性均不如方式 1。新代码请用方式 1（`reasoning_effort`）。
 
 **curl:**
 
@@ -35,37 +70,6 @@ response = client.chat.completions.create(
     messages=[{"role": "user", "content": "What is 2+2?"}],
     max_tokens=100,
     extra_body={"chat_template_kwargs": {"enable_thinking": False}},
-)
-print(response.choices[0].message.content)
-```
-
-### 方式 2: `reasoning_effort`（OpenAI 兼容参数）
-
-**curl:**
-
-```bash
-curl -s http://localhost:18001/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "qwen3.6-27b",
-    "messages": [{"role": "user", "content": "What is 2+2?"}],
-    "max_tokens": 100,
-    "reasoning_effort": "none"
-  }'
-```
-
-**OpenAI SDK:**
-
-```python
-from openai import OpenAI
-
-client = OpenAI(base_url="http://localhost:18001/v1", api_key="not-needed")
-
-response = client.chat.completions.create(
-    model="qwen3.6-27b",
-    messages=[{"role": "user", "content": "What is 2+2?"}],
-    max_tokens=100,
-    extra_body={"reasoning_effort": "none"},
 )
 print(response.choices[0].message.content)
 ```

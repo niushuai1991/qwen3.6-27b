@@ -148,7 +148,7 @@ v0.24.0 对 drafter 的混合 sliding/full 注意力处理粗放（无 PR #40898
 
 ## Baseline: MTP k=3（当前配置）
 
-**配置**: `gpu-memory-utilization=0.90`, `max-num-batched-tokens=8192`, MTP `num_speculative_tokens=3`, thinking 关闭（`chat_template_kwargs={"enable_thinking": false}`）
+**配置**: `gpu-memory-utilization=0.90`, `max-num-batched-tokens=8192`, MTP `num_speculative_tokens=3`, thinking 关闭（`"reasoning_effort": "none"`）
 **GPU 显存**: ~40/46 GB
 **报告**: [`docs/benchmark-mtp_k3_no_think.md`](benchmark-mtp_k3_no_think.md)
 **日期**: 2026-07-09
@@ -169,7 +169,7 @@ v0.24.0 对 drafter 的混合 sliding/full 注意力处理粗放（无 PR #40898
 - **TTFT**: 0.21-0.32s（并发无关），说明 prefill 排队未构成瓶颈（`max-num-batched-tokens=8192` 足够覆盖 ~144 token prompt）
 - **Acceptance**: 0.54 ≈ 2.62 tokens/step
 - **所有并发 0 失败**
-- **Thinking 说明**: benchmark 默认关闭 thinking（`chat_template_kwargs={"enable_thinking": false}`）。若开启 thinking，TTFT 会飙升至 ~52s（thinking tokens 出现在 `reasoning` 字段，首个 `content` token 需等 thinking 结束），TPOT 也会被快速 thinking tokens 拉低至 ~6ms。详见 [`docs/disable-thinking.md`](disable-thinking.md)
+- **Thinking 说明**: benchmark 默认关闭 thinking（`"reasoning_effort": "none"`）。若开启 thinking，TTFT 会飙升至 ~52s（thinking tokens 出现在 `reasoning` 字段，首个 `content` token 需等 thinking 结束），TPOT 也会被快速 thinking tokens 拉低至 ~6ms。详见 [`docs/disable-thinking.md`](disable-thinking.md)
 
 ### Acceptance 分解
 

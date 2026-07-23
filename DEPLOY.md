@@ -200,7 +200,7 @@ nvidia-smi
 {
   "model": "qwen3.6-27b",
   "messages": [...],
-  "chat_template_kwargs": {"enable_thinking": false}
+  "reasoning_effort": "none"
 }
 ```
 
