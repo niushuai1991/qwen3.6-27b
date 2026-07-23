@@ -80,14 +80,14 @@ docker compose down                          # 停止
 curl -s http://localhost:18001/health         # 服务状态
 nvidia-smi --query-gpu=memory.used --format=csv  # 显存使用
 
-# 关闭 thinking（chat_template_kwargs）
+# 关闭 thinking（reasoning_effort；详见 docs/disable-thinking.md）
 curl -s http://localhost:18001/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "qwen3.6-27b",
     "messages": [{"role": "user", "content": "Say hello in one sentence."}],
     "max_tokens": 100,
-    "chat_template_kwargs": {"enable_thinking": false}
+    "reasoning_effort": "none"
   }'
 
 # 基准测试
