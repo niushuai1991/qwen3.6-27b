@@ -1,0 +1,59 @@
+# SGLang smoke-test 部署（独立文件，不替换 vLLM 的 docker-compose.yml）
+#
+# 用途：评估 SGLang + NEXTN(MTP) 投机解码能否在 RTX PRO 6000 Blackwell(SM120) 单卡
+#       跑通更高 k 并超过 vLLM k=3 baseline。修复 PR #27998(spec-v2 + extra_buffer 崩溃)
+#       仅存在于 dev 构建(merge 2026-07-16 > 稳定版 07-14)，故用 dev-cu13(CUDA13 支持 SM120)。
+#
+# 运行（需先停 vLLM 释放 GPU，单卡装不下两服务）：
+#   docker compose down                   # 停 vLLM（默认 compose）
+#   docker compose -f docker-compose.sglang.yml up -d
+# 扫 k：用环境变量覆盖（默认 k=3，num-draft-tokens = steps+1）：
+#   SPEC_STEPS=4 SPEC_DRAFT_TOKENS=5 docker compose -f docker-compose.sglang.yml up -d
+# 测完恢复：
+#   docker compose -f docker-compose.sglang.yml down && docker compose up -d
+
+services:
+  sglang:
+    image: lmsysorg/sglang:dev-cu13
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=0
+      - HF_HOME=/models/.cache
+      - TZ=Asia/Shanghai
+      - SGLANG_ENABLE_SPEC_V2=1   # 显式开 overlap(spec-v2) 调度 = 修复路径，SGLang 性能招牌
+    network_mode: host
+    ipc: host
+    volumes:
+      - /data/models:/models
+      - /data/sglang-logs:/logs
+    # 该镜像 entrypoint(nvidia_entrypoint.sh) 仅 exec "$@"，需显式调用 launch_server
+    command: >
+      python3 -m sglang.launch_server
+      --model-path /models/Qwen3.6-27B-FP8
+      --served-model-name qwen3.6-27b
+      --host 0.0.0.0
+      --port 18001
+      --trust-remote-code
+      --context-length 32768
+      --mem-fraction-static 0.90
+      --max-running-requests 10
+      --chunked-prefill-size 8192
+      --kv-cache-dtype fp8_e4m3
+      --reasoning-parser qwen3
+      --speculative-algorithm NEXTN
+      --speculative-num-steps ${SPEC_STEPS:-3}
+      --speculative-eagle-topk 1
+      --speculative-num-draft-tokens ${SPEC_DRAFT_TOKENS:-4}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: "no"   # smoke test：崩溃不自动重启，便于看日志
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:18001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3

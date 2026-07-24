@@ -448,3 +448,28 @@ vLLM 启动参数与 baseline 完全相同。
 **结论**：网宿 decode 更快（后端算力强于单张 L40S），但 TTFT 慢（公网往返）且波动大（共享集群）；自部署首字延迟与稳定性更优。长输出场景网宿端到端快 ~18%，短输出/交互式场景自部署更优。数据合规/成本/可控性上自部署占优。
 
 > ⚠️ 本对比为 c=1；自部署在 c=5/10 下 output_tps 达 169/309，网宿并发扩展性未测。详细数据、原始各轮与测量局限见 [`benchmark-wangsu-vs-selfhosted.md`](benchmark-wangsu-vs-selfhosted.md)，复现脚本 `measure_latency.py`（项目根）。
+
+## SGLang MTP 评估（2026-07-24，结论：NO-GO，维持 vLLM k=3）
+
+**动机**：SGLang spec-v2(overlap) + NEXTN(MTP) 可能绕开 vLLM k≥4 崩溃、单卡稳定跑更高 k。前提是上游 issue [#31249](https://github.com/sgl-project/sglang/issues/31249)（本模型 warmup 崩溃）已被 PR [#27998](https://github.com/sgl-project/sglang/pull/27998) 修复——已核实修复在 `lmsysorg/sglang:dev-cu13` 镜像内（`schedule_batch.py:1716`），且本卡（SM120 单卡）实测**全程 0 崩溃**，`Capture target verify CUDA graph`（崩溃路径）成功。故障/修复核实详见 [`2026-07-24-fault-sglang-qwen35-mtp-specv2-crash.md`](2026-07-24-fault-sglang-qwen35-mtp-specv2-crash.md)。
+
+**配置**：`docker-compose.sglang.yml`（独立，未动 vLLM compose）；NEXTN topk=1、fp8 KV、radix cache、`SGLANG_ENABLE_SPEC_V2=1`、`mem-fraction-static=0.90`、`max-running-requests=10`；k 用环境变量参数化。
+
+**结果（output_tps，0 失败）**：
+
+| 并发 | vLLM k=3（基线） | SGLang k=3 | SGLang k=4 | SGLang k=5 | 最佳 vs 基线 |
+|:---:|:---:|:---:|:---:|:---:|:---:|
+| c=1  | 81.5  | 84.6 | 85.3 | 84.4 | +4.7% |
+| c=5  | 357.5 | 362.5 | 356.9 | 348.8 | +1.4% |
+| c=10 | 653.7 | 622.4 | 607.8 | 599.6 | −4.8% |
+
+**判决：NO-GO**（判据：任一 k 超基线 ≥10%；实际最佳 +4.7%，c=10 全线低于基线）。
+
+**关键结论**：
+1. **SGLang k=3 ≈ vLLM k=3**——无引擎基线优势，"SGLang 本身更快"假设不成立。
+2. **更高 k 不赢 k=3 = acceptance 衰减墙，引擎无关**——k3→4→5 在 c=5/c=10 单调走低，与 vLLM 侧 acceptance 递减同构；SGLang 用同一 draft head，换引擎不改变深层 draft 被拒比例。
+3. **能力解锁 ≠ 收益**：SGLang 确能稳定跑 k≥4（vLLM 崩），但 acceptance 衰减使此能力不转化为吞吐；仅当未来 acceptance 跃迁（自训 drafter）或多卡 overlap 时才有意义。
+
+**决策：生产维持 vLLM k=3**，不引入 SGLang。binding 约束仍是 acceptance（drafter 质量），引擎无关；唯一实质杠杆仍是自训 drafter（阻塞：无业务数据集）与多卡（阻塞：成本）。
+
+详细分析与逐 k 明细：[`benchmark-sglang-mtp-evaluation.md`](benchmark-sglang-mtp-evaluation.md)、`benchmark-sglang_k3/k4/k5.md`。
