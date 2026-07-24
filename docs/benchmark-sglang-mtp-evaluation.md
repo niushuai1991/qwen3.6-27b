@@ -40,7 +40,29 @@ decode tok/s（单流 decode 阶段有效吞吐）：
 | c=5  | 76.9 | 75.7 | 74.7 |
 | c=10 | 68.5 | 65.7 | 64.8 |
 
-> 全部 0 失败请求。逐 k 明细见 `docs/benchmark-sglang_k3.md` / `_k4` / `_k5`（acceptance 因 SGLang 指标格式与 vLLM 不同，benchmark.py 未采集，记 N/A）。
+> 全部 0 失败请求。逐 k 明细见 `docs/benchmark-sglang_k3.md` / `_k4` / `_k5`。
+
+### Acceptance（补采，2026-07-24）
+
+初版 benchmark.py 仅解析 vLLM 的 Prometheus 指标格式，SGLang 侧 acceptance 记 N/A。已扩展脚本兼容双引擎（vLLM Counter before/after delta / SGLang Gauge 瞬时直读，详见 `docs/superpowers/specs/2026-07-24-benchmark-sglang-acceptance-design.md`），重跑补采如下。
+
+**acceptance_rate**（accepted / proposed drafts，不含 bonus，跨引擎可比）：
+
+| 并发 | SGLang k=3 | SGLang k=4 | SGLang k=5 | vLLM k=3（基线） |
+|:---:|:---:|:---:|:---:|:---:|
+| c=1  | 0.60 | 0.41 | 0.37 | 0.55 |
+| c=5  | 0.63 | 0.47 | 0.36 | 0.54 |
+| c=10 | 0.46 | 0.39 | 0.32 | 0.53 |
+
+**accept_length**（连续接受长度，含 bonus token；SGLang 直读 `sglang:spec_accept_length`）：
+
+| 并发 | k=3 | k=4 | k=5 |
+|:---:|:---:|:---:|:---:|
+| c=1  | 2.80 | 2.65 | 2.85 |
+| c=5  | 2.88 | 2.86 | 2.79 |
+| c=10 | 2.39 | 2.57 | 2.62 |
+
+SGLang k=3 单流 acceptance（0.60）略高于 vLLM（0.55），但随 k 单调递减（c=1：0.60→0.41→0.37），与 vLLM 侧 k3=0.54/k4=0.46/k5=0.39 的衰减完全同构——**acceptance 衰减墙引擎无关**，由实测再次确认（此前为推测，现已闭环）。
 
 ## Go/No-Go 判决
 
@@ -51,7 +73,7 @@ decode tok/s（单流 decode 阶段有效吞吐）：
 ## 分析：为什么更高 k 仍不赢
 
 1. **SGLang k=3 ≈ vLLM k=3（无引擎基线优势）**：c=1/5 略快（+3.8%/+1.4%，噪声内）、c=10 略慢（−4.8%）。"SGLang 引擎本身更快"的假设不成立，两大引擎在本配置同口径持平。
-2. **更高 k 不赢 k=3 = acceptance 衰减墙，引擎无关**：k=3→4→5 在 c=5/c=10 上单调走低（362.5→356.9→348.8；622.4→607.8→599.6），与 vLLM 侧 k3=0.54/k4=0.46/k5=0.39 的 acceptance 递减完全同构。SGLang 用**同一个 MTP draft head**、同一套 rejection sampling，深层 draft 被拒比例不变 → 提高 k 只增加被拒草稿的浪费算力，不增有效产出。
+2. **更高 k 不赢 k=3 = acceptance 衰减墙，引擎无关**：k=3→4→5 在 c=5/c=10 上单调走低（362.5→356.9→348.8；622.4→607.8→599.6），与 vLLM 侧 k3=0.54/k4=0.46/k5=0.39 的 acceptance 递减完全同构（SGLang 实测 acceptance_rate c=1：k3=0.60/k4=0.41/k5=0.37，见上「Acceptance」节，此前为推测现已闭环）。SGLang 用**同一个 MTP draft head**、同一套 rejection sampling，深层 draft 被拒比例不变 → 提高 k 只增加被拒草稿的浪费算力，不增有效产出。
 3. **c=10 SGLang 略逊 + 随 k 退化更明显**：单卡 decode 在高并发已饱和，spec-v2 的 overlap 调度在饱和 GPU 上挤不出额外 overlap 空间（项目早已定位的根因：单卡 decode 占满 → drafter 无 overlap 空隙）。
 
 ## 能力解锁 vs 收益：两件事

@@ -1,4 +1,4 @@
-"""Benchmark local vLLM deployment with a native streaming client.
+"""Benchmark local vLLM/SGLang deployment with a native streaming client.
 
 计时口径与 measure_latency.py 同源：客户端 streaming，逐 SSE chunk 记录首/末 content
 token 时间戳，产出 TTFT（≈prefill）与 decode 阶段吞吐 decode_tok_s。
@@ -11,8 +11,13 @@ token 时间戳，产出 TTFT（≈prefill）与 decode 阶段吞吐 decode_tok_
 
 content_tokens 来自末 chunk 的 usage（stream_options.include_usage），减去 reasoning_tokens。
 
+Acceptance 采集兼容两种引擎（--engine auto 自动探测）：
+    vLLM    Prometheus Counter（累计）→ before/after delta；有逐位明细
+    SGLang  Prometheus Gauge（mostrecent 瞬时）→ 直读 after 值；无逐位明细，额外给 accept_length
+
 Usage:
     uv run python benchmark.py --label "mtp_k3_native" --concurrency 1,5,10
+    uv run python benchmark.py --label "sglang_k3" --engine sglang   # 显式指定亦可
 
 Requirements:
     pip install httpx
@@ -38,7 +43,8 @@ DEFAULT_ENDPOINT = "http://localhost:18001/v1"
 DEFAULT_API_KEY = "not-needed"
 DEFAULT_MAX_TOKENS = 2048
 DEFAULT_TIMEOUT = 300
-METRICS_URL = "http://localhost:18001/metrics"
+DEFAULT_ENGINE = "auto"
+METRICS_URL = "http://localhost:18001/metrics"  # fallback if endpoint derivation fails
 
 
 def parse_concurrency(raw: str) -> list[int]:
@@ -72,18 +78,30 @@ def load_prompts(prompts_dir: Path) -> list[dict]:
     return payloads
 
 
-def fetch_metrics() -> dict:
-    """Fetch spec decode metrics from vLLM Prometheus endpoint."""
-    try:
-        result = subprocess.run(
-            ["curl", "-s", METRICS_URL],
-            capture_output=True, text=True, timeout=10,
-        )
-        text = result.stdout
-    except Exception as e:
-        print(f"  [WARN] Failed to fetch metrics: {e}")
-        return {}
+def metrics_url_from_endpoint(endpoint: str) -> str:
+    """Derive the Prometheus metrics URL from the API endpoint.
 
+    http://host:port/v1  ->  http://host:port/metrics
+    """
+    url = endpoint.rstrip("/")
+    if url.endswith("/v1"):
+        return url[:-3] + "/metrics"
+    return url + "/metrics"
+
+
+def detect_engine(text: str):
+    """Detect inference engine from /metrics text. Returns 'vllm' | 'sglang' | None."""
+    if not text:
+        return None
+    if "vllm:spec_decode_num_accepted_tokens_total" in text:
+        return "vllm"
+    if "sglang:spec_accept_rate" in text:
+        return "sglang"
+    return None
+
+
+def parse_vllm_metrics(text: str) -> dict:
+    """Parse vLLM spec-decode counters (cumulative; needs before/after delta)."""
     metrics = {}
     patterns = {
         "accepted_tokens": r'vllm:spec_decode_num_accepted_tokens_total\{[^}]*\} (\S+)',
@@ -102,25 +120,97 @@ def fetch_metrics() -> dict:
         )
         if m:
             metrics[f"accepted_pos_{pos}"] = float(m.group(1))
-
     return metrics
 
 
-def compute_acceptance(before: dict, after: dict) -> dict:
-    """Compute acceptance rate from before/after metric snapshots."""
-    draft_delta = after.get("draft_tokens", 0) - before.get("draft_tokens", 0)
-    accepted_delta = after.get("accepted_tokens", 0) - before.get("accepted_tokens", 0)
+def parse_sglang_metrics(text: str) -> dict:
+    """Parse SGLang spec-decode gauges (instantaneous mostrecent; read directly).
 
-    result = {
-        "draft_tokens": draft_delta,
-        "accepted_tokens": accepted_delta,
+    SGLang exposes spec_accept_rate / spec_accept_length (with bonus) /
+    spec_num_steps / spec_num_draft_tokens / spec_verify_calls_total.
+    No per-position breakdown.
+    """
+    metrics = {}
+    patterns = {
+        "accept_rate": r'sglang:spec_accept_rate\{[^}]*\}\s+(\S+)',
+        "accept_length": r'sglang:spec_accept_length\{[^}]*\}\s+(\S+)',
+        "num_steps": r'sglang:spec_num_steps\{[^}]*\}\s+(\S+)',
+        "num_draft_tokens": r'sglang:spec_num_draft_tokens\{[^}]*\}\s+(\S+)',
+        "verify_calls": r'sglang:spec_verify_calls_total\{[^}]*\}\s+(\S+)',
     }
-    result["acceptance_rate"] = accepted_delta / draft_delta if draft_delta > 0 else None
+    for name, pattern in patterns.items():
+        m = re.search(pattern, text)
+        if m:
+            try:
+                metrics[name] = float(m.group(1))
+            except ValueError:
+                pass
+    return metrics
 
-    for pos in range(4):
-        pos_before = before.get(f"accepted_pos_{pos}", 0)
-        pos_after = after.get(f"accepted_pos_{pos}", 0)
-        result[f"accepted_pos_{pos}"] = pos_after - pos_before
+
+def fetch_metrics(metrics_url: str, engine: str = "auto") -> dict:
+    """Fetch spec-decode metrics. Returns {'engine': str|None, 'raw': dict}.
+
+    engine='auto' probes /metrics text for the vllm vs sglang prefix.
+    """
+    try:
+        result = subprocess.run(
+            ["curl", "-s", metrics_url],
+            capture_output=True, text=True, timeout=10,
+        )
+        text = result.stdout
+    except Exception as e:
+        print(f"  [WARN] Failed to fetch metrics: {e}")
+        return {"engine": None, "raw": {}}
+
+    resolved = detect_engine(text) if engine == "auto" else engine
+    if resolved == "vllm":
+        raw = parse_vllm_metrics(text)
+    elif resolved == "sglang":
+        raw = parse_sglang_metrics(text)
+    else:
+        raw = {}
+    return {"engine": resolved, "raw": raw}
+
+
+def compute_acceptance(before: dict, after: dict) -> dict:
+    """Compute acceptance from before/after snapshots. Dispatches by engine.
+
+    vLLM:    counters -> before/after delta; acceptance_rate = accepted/draft;
+             accept_length = accepted/num_drafts + 1 (bonus).
+    SGLang:  gauges (mostrecent) -> read after value directly; no delta, no
+             per-position breakdown (SGLang does not expose one).
+    """
+    engine = after.get("engine") or before.get("engine")
+    result = {
+        "engine": engine,
+        "draft_tokens": None,
+        "accepted_tokens": None,
+        "num_drafts": None,
+        "acceptance_rate": None,
+        "accept_length": None,
+        "accepted_pos_0": None, "accepted_pos_1": None,
+        "accepted_pos_2": None, "accepted_pos_3": None,
+    }
+
+    if engine == "vllm":
+        b, a = before.get("raw", {}), after.get("raw", {})
+        draft_delta = a.get("draft_tokens", 0) - b.get("draft_tokens", 0)
+        accepted_delta = a.get("accepted_tokens", 0) - b.get("accepted_tokens", 0)
+        drafts_delta = a.get("num_drafts", 0) - b.get("num_drafts", 0)
+        result["draft_tokens"] = draft_delta
+        result["accepted_tokens"] = accepted_delta
+        result["num_drafts"] = drafts_delta
+        result["acceptance_rate"] = accepted_delta / draft_delta if draft_delta > 0 else None
+        result["accept_length"] = (accepted_delta / drafts_delta + 1) if drafts_delta > 0 else None
+        for pos in range(4):
+            result[f"accepted_pos_{pos}"] = a.get(f"accepted_pos_{pos}", 0) - b.get(f"accepted_pos_{pos}", 0)
+
+    elif engine == "sglang":
+        raw = after.get("raw", {})
+        result["acceptance_rate"] = raw.get("accept_rate")
+        result["accept_length"] = raw.get("accept_length")
+        result["num_drafts"] = raw.get("verify_calls")
 
     return result
 
@@ -222,6 +312,8 @@ async def run_single_scenario(
     timeout: int,
     label: str,
     enable_thinking: bool = False,
+    metrics_url: str = METRICS_URL,
+    engine: str = DEFAULT_ENGINE,
 ) -> dict:
     """Run one concurrency scenario with native streaming client. Returns stats dict."""
     base = []
@@ -244,7 +336,7 @@ async def run_single_scenario(
     sem = asyncio.Semaphore(clients)
 
     print(f"\n  [{label}] clients={clients}, n_requests={n_requests}, max_tokens={max_tokens}")
-    metrics_before = fetch_metrics()
+    metrics_before = fetch_metrics(metrics_url, engine)
 
     async with httpx.AsyncClient(headers=headers) as client:
         async def bounded(i):
@@ -256,7 +348,7 @@ async def run_single_scenario(
         test_time = time.perf_counter() - t0
 
     await asyncio.sleep(1)  # let server flush metrics
-    metrics_after = fetch_metrics()
+    metrics_after = fetch_metrics(metrics_url, engine)
     acceptance = compute_acceptance(metrics_before, metrics_after)
 
     ok = [r for r in results if not r["error"]]
@@ -297,6 +389,8 @@ async def run_single_scenario(
         "wall_p50_s": _percentile(walls, 50),
         "acceptance": acceptance,
         "acceptance_rate": acceptance.get("acceptance_rate"),
+        "accept_length": acceptance.get("accept_length"),
+        "spec_engine": acceptance.get("engine"),
         "per_request": results,
     }
 
@@ -336,13 +430,15 @@ def generate_report(results: list[dict], label: str, model: str, endpoint: str) 
         "",
         "## Results",
         "",
-        "| Concurrency | Requests | Time(s) | TTFT p50 | TTFT p90 | TTLT p90 | TPOT mean | decode tok/s | Output TPS | Acceptance | Failed |",
-        "|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|",
+        "| Concurrency | Requests | Time(s) | TTFT p50 | TTFT p90 | TTLT p90 | TPOT mean | decode tok/s | Output TPS | Acceptance | Accept len | Failed |",
+        "|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|",
     ]
 
     for r in results:
         acc = r.get("acceptance_rate")
         acc_str = f"{acc:.2f}" if acc is not None else "N/A"
+        al = r.get("accept_length")
+        al_str = f"{al:.2f}" if al is not None else "N/A"
         lines.append(
             f"| {r['clients']} | {r['total_requests']} | "
             f"{_fmt(r['total_test_time_s'], '.1f')} | "
@@ -352,6 +448,7 @@ def generate_report(results: list[dict], label: str, model: str, endpoint: str) 
             f"{_fmt(r['decode_tok_s_mean'], '.1f')} | "
             f"{_fmt(r['output_tps'], '.1f')} | "
             f"{acc_str} | "
+            f"{al_str} | "
             f"{r['failed_requests']} |"
         )
     lines.append("")
@@ -376,12 +473,19 @@ def generate_report(results: list[dict], label: str, model: str, endpoint: str) 
         lines.append(f"| Output TPS (aggregate, incl TTFT) | {_fmt(r['output_tps'], '.1f')} tok/s |")
 
         acc = r.get("acceptance", {})
+        lines.append(f"| Spec engine | {acc.get('engine') or 'N/A'} |")
         acc_rate = r.get("acceptance_rate")
         acc_rate_str = f"{acc_rate:.2f}" if acc_rate is not None else "N/A"
+        acc_len = acc.get("accept_length")
+        acc_len_str = f"{acc_len:.2f}" if acc_len is not None else "N/A"
         lines.append(f"| **Acceptance rate** | **{acc_rate_str}** |")
+        lines.append(f"| **Accept length** (incl bonus) | **{acc_len_str}** |")
+        if acc.get("draft_tokens") is not None:
+            lines.append(f"| Draft tokens (proposed) | {acc['draft_tokens']:.0f} |")
+            lines.append(f"| Accepted tokens | {acc['accepted_tokens']:.0f} |")
         for pos in range(4):
-            val = acc.get(f"accepted_pos_{pos}", 0)
-            if val > 0:
+            val = acc.get(f"accepted_pos_{pos}")
+            if val:  # None (sglang) or 0 (vllm k=3 pos 3) -> skip
                 lines.append(f"| Accepted at position {pos} | {val:.0f} |")
         lines.append("")
 
@@ -394,12 +498,19 @@ def generate_report(results: list[dict], label: str, model: str, endpoint: str) 
         "与 `measure_latency.py` 同源。"
         "Output TPS = Σ content_tokens / 总耗时（含 TTFT，整体聚合，对齐 llmeter 历史口径）。"
     )
+    lines.append("")
+    lines.append(
+        "> **Acceptance 口径**：acceptance_rate = accepted/proposed drafts（不含 bonus），"
+        "vLLM/SGLang 跨引擎可比。accept_length 含 bonus token。"
+        "vLLM 走 Counter before/after delta（含逐位明细）；"
+        "SGLang 走 Gauge 瞬时直读（无逐位明细）。"
+    )
     return "\n".join(lines)
 
 
 async def main():
     parser = argparse.ArgumentParser(
-        description="Benchmark local vLLM deployment with native streaming client",
+        description="Benchmark local vLLM/SGLang deployment with native streaming client",
     )
     parser.add_argument(
         "--label", required=True,
@@ -441,13 +552,20 @@ async def main():
         "--enable-thinking", action="store_true",
         help="Enable Qwen3 thinking mode (default: disabled via reasoning_effort=none)",
     )
+    parser.add_argument(
+        "--engine", default=DEFAULT_ENGINE,
+        choices=["auto", "vllm", "sglang"],
+        help="Metrics backend for spec-decode acceptance: auto-detect (default) / vllm / sglang",
+    )
     args = parser.parse_args()
 
     concurrency_levels = parse_concurrency(args.concurrency)
+    metrics_url = metrics_url_from_endpoint(args.endpoint)
 
     print("=" * 60)
     print(f"  Benchmark: {args.label}")
     print(f"  Endpoint:  {args.endpoint}")
+    print(f"  Metrics:   {metrics_url}  (engine={args.engine})")
     print(f"  Model:     {args.model}")
     print(f"  Concurrency: {concurrency_levels}")
     print(f"  Requests per level: {args.n_requests}")
@@ -455,12 +573,14 @@ async def main():
     print("=" * 60)
 
     # Verify metrics endpoint
-    initial = fetch_metrics()
-    if initial:
-        print(f"\n  vLLM metrics available ({METRICS_URL})")
+    initial = fetch_metrics(metrics_url, args.engine)
+    det = initial.get("engine")
+    if det:
+        print(f"\n  Metrics available ({metrics_url}) — engine: {det}")
     else:
-        print(f"\n  [WARN] vLLM metrics not available. Acceptance data will be N/A.")
-        print(f"  Ensure --enable-metrics is set, or check {METRICS_URL}")
+        print(f"\n  [WARN] No spec-decode metrics detected at {metrics_url}"
+              f"{' (engine=' + args.engine + ')' if args.engine != 'auto' else ''}.")
+        print(f"  Acceptance data will be N/A. Ensure the server was launched with --enable-metrics.")
 
     # Load prompts
     prompts_dir = Path(args.prompts_dir)
@@ -485,6 +605,8 @@ async def main():
                 timeout=args.timeout,
                 label=args.label,
                 enable_thinking=args.enable_thinking,
+                metrics_url=metrics_url,
+                engine=args.engine,
             )
             results.append(r)
         except Exception as e:
@@ -511,16 +633,19 @@ async def main():
     print(f"\n{'=' * 60}")
     print(f"  Summary: {args.label}")
     print(f"{'=' * 60}")
-    print(f"  {'conc':>4}  {'decode/s':>8}  {'TPOT':>7}  {'out_tps':>8}  {'accept':>6}  {'fail':>4}")
-    print(f"  {'-'*4}  {'-'*8}  {'-'*7}  {'-'*8}  {'-'*6}  {'-'*4}")
+    print(f"  {'conc':>4}  {'decode/s':>8}  {'TPOT':>7}  {'out_tps':>8}  {'accept':>6}  {'acclen':>6}  {'fail':>4}")
+    print(f"  {'-'*4}  {'-'*8}  {'-'*7}  {'-'*8}  {'-'*6}  {'-'*6}  {'-'*4}")
     for r in results:
         acc = r.get("acceptance_rate")
         acc_str = f"{acc:.2f}" if acc is not None else "N/A"
+        al = r.get("accept_length")
+        al_str = f"{al:.2f}" if al is not None else "N/A"
         print(f"  {r['clients']:>4}  "
               f"{_fmt(r['decode_tok_s_mean'], '.1f'):>8}  "
               f"{_ms(r['tpot_mean_ms']):>7}ms  "
               f"{_fmt(r['output_tps'], '.1f'):>8}  "
               f"{acc_str:>6}  "
+              f"{al_str:>6}  "
               f"{r['failed_requests']:>4}")
 
 

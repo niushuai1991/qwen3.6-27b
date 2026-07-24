@@ -44,6 +44,7 @@ services:
       --speculative-num-steps ${SPEC_STEPS:-3}
       --speculative-eagle-topk 1
       --speculative-num-draft-tokens ${SPEC_DRAFT_TOKENS:-4}
+      --enable-metrics
     deploy:
       resources:
         reservations:

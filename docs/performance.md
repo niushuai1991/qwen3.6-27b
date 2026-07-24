@@ -501,6 +501,16 @@ vLLM 启动参数与 baseline 完全相同。
 | c=5  | 357.5 | 362.5 | 356.9 | 348.8 | +1.4% |
 | c=10 | 653.7 | 622.4 | 607.8 | 599.6 | −4.8% |
 
+**acceptance（补采，2026-07-24）**：初版 `benchmark.py` 仅解析 vLLM Prometheus 指标，SGLang 侧记 N/A；已扩展脚本兼容双引擎（vLLM Counter delta / SGLang Gauge 直读）并重跑补采。
+
+| 并发 | SGLang k=3 | SGLang k=4 | SGLang k=5 | vLLM k=3（基线） |
+|:---:|:---:|:---:|:---:|:---:|
+| c=1  | 0.60 | 0.41 | 0.37 | 0.55 |
+| c=5  | 0.63 | 0.47 | 0.36 | 0.54 |
+| c=10 | 0.46 | 0.39 | 0.32 | 0.53 |
+
+> acceptance_rate 随 k 单调递减，SGLang 与 vLLM 衰减同构——此前为推测，现已实测闭环。脚本设计见 [`superpowers/specs/2026-07-24-benchmark-sglang-acceptance-design.md`](superpowers/specs/2026-07-24-benchmark-sglang-acceptance-design.md)。
+
 **判决：NO-GO**（判据：任一 k 超基线 ≥10%；实际最佳 +4.7%，c=10 全线低于基线）。
 
 **关键结论**：
