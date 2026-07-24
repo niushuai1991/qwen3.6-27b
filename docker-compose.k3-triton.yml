@@ -1,0 +1,46 @@
+# 临时测试 compose：k=3 + triton_attn(target+draft) + fp8 KV
+# 目的：与 k=4 triton_attn 做「同 backend 干净 k 值对比」，并对照 k=3 FlashInfer 生产基线判断 triton_attn 是否可作生产 backend。
+services:
+  vllm:
+    image: vllm/vllm-openai:v0.25.1
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=0
+      - HF_HOME=/models/.cache
+      - TZ=Asia/Shanghai
+    network_mode: host
+    ipc: host
+    volumes:
+      - /data/models:/models
+      - /data/vllm-logs:/logs
+    command: >
+      /models/Qwen3.6-27B-FP8
+      --served-model-name qwen3.6-27b
+      --host 0.0.0.0
+      --port 18001
+      --trust-remote-code
+      --dtype auto
+      --attention-backend triton_attn
+      --kv-cache-dtype fp8_e4m3
+      --max-model-len 32768
+      --max-num-seqs 10
+      --gpu-memory-utilization 0.90
+      --max-num-batched-tokens 8192
+      --enable-prefix-caching
+      --enable-chunked-prefill
+      --speculative-config '{"method":"mtp","num_speculative_tokens":3,"attention_backend":"triton_attn"}'
+      --reasoning-parser qwen3
+      --language-model-only
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: "no"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:18001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3

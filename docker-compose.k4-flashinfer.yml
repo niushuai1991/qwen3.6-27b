@@ -1,0 +1,49 @@
+# 复现用 compose：k=4 + FlashInfer（默认 backend，不设 attention-backend）+ fp8 KV
+# 目的：在 v0.25.1 上复现 MTP k≥4 的 FlashInfer 崩溃，抓确切 traceback（kernel/.cu line/vLLM 触发点）。
+services:
+  vllm:
+    image: vllm/vllm-openai:v0.25.1
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=0
+      - HF_HOME=/models/.cache
+      - TZ=Asia/Shanghai
+      # 测试假设：FlashInfer prefill workspace 默认 394MiB 对 head_dim=256 + sm120 过小
+      # （上游 #48428：需 max_num_batched_tokens×qo_heads×head_dim×16 = 8192×24×256×16 ≈ 768MiB）。
+      # 设 1GiB 验证「workspace 溢出」是否为 k≥4 崩溃真因（保 FlashInfer + fp8）。
+      - VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE=1073741824
+    network_mode: host
+    ipc: host
+    volumes:
+      - /data/models:/models
+      - /data/vllm-logs:/logs
+    command: >
+      /models/Qwen3.6-27B-FP8
+      --served-model-name qwen3.6-27b
+      --host 0.0.0.0
+      --port 18001
+      --trust-remote-code
+      --dtype auto
+      --kv-cache-dtype fp8_e4m3
+      --max-model-len 32768
+      --max-num-seqs 10
+      --gpu-memory-utilization 0.90
+      --max-num-batched-tokens 8192
+      --enable-prefix-caching
+      --enable-chunked-prefill
+      --speculative-config '{"method":"mtp","num_speculative_tokens":4}'
+      --reasoning-parser qwen3
+      --language-model-only
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: "no"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:18001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3

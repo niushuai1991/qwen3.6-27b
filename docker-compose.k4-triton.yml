@@ -1,0 +1,50 @@
+# 临时测试 compose：验证「triton_attn 给 target+draft 是否修好 MTP k≥4 FlashInfer 崩溃」
+# 仅相对 docker-compose.yml 改两处：
+#   1. --attention-backend triton_attn            （target 用 triton，避开 FlashInfer BatchPrefillWithPagedKVCache OOB）
+#   2. speculative-config 加 "attention_backend":"triton_attn"  （MTP draft head 也用 triton，否则 draft 仍选 FlashInfer）
+# 保留 --kv-cache-dtype fp8_e4m3（验证「保住 fp8 KV + 不崩」这一组合）。
+# 参考上游 #37754 评论 agata-corp（同款 RTX PRO 6000 SM120 96GB）。
+services:
+  vllm:
+    image: vllm/vllm-openai:v0.25.1
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=0
+      - HF_HOME=/models/.cache
+      - TZ=Asia/Shanghai
+    network_mode: host
+    ipc: host
+    volumes:
+      - /data/models:/models
+      - /data/vllm-logs:/logs
+    command: >
+      /models/Qwen3.6-27B-FP8
+      --served-model-name qwen3.6-27b
+      --host 0.0.0.0
+      --port 18001
+      --trust-remote-code
+      --dtype auto
+      --attention-backend triton_attn
+      --kv-cache-dtype fp8_e4m3
+      --max-model-len 32768
+      --max-num-seqs 10
+      --gpu-memory-utilization 0.90
+      --max-num-batched-tokens 8192
+      --enable-prefix-caching
+      --enable-chunked-prefill
+      --speculative-config '{"method":"mtp","num_speculative_tokens":4,"attention_backend":"triton_attn"}'
+      --reasoning-parser qwen3
+      --language-model-only
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: "no"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:18001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3

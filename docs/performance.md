@@ -17,6 +17,8 @@
 | **RTX PRO 6000 / FLASH_ATTN k=3** | 2026-07-23 | MTP k=3 | `--attention-backend FLASH_ATTN`（bf16 KV，去 fp8） | 68.6 | 367.7 | 672.9 | — | 13.9ms | 配置归因：c=1 0.84× / c=10 +3%（vs fp8 baseline）accept 0.54 |
 | **RTX PRO 6000 / FLASH_ATTN k=4** | 2026-07-23 | MTP k=4 | `--attention-backend FLASH_ATTN`（bf16 KV） | 69.3 | 337.6 | 665.7 | — | 13.9ms | ✅ **崩溃已修复**（0 失败）；accept 0.46；仍不赢 k=3 |
 | **RTX PRO 6000 / FLASH_ATTN k=5** | 2026-07-23 | MTP k=5 | `--attention-backend FLASH_ATTN`（bf16 KV） | 70.1 | 348.8 | 620.0 | — | 14.6ms | ✅ **崩溃已修复**（0 失败）；accept 0.39；仍不赢 k=3 |
+| **RTX PRO 6000 / triton_attn k=3** | 2026-07-24 | MTP k=3 | `--attention-backend triton_attn` + draft `attention_backend=triton_attn`（**保留 fp8 KV**） | 81.2 | 356.9 | 679.9 | 0.298s | 13.7ms | ✅ 真因修复路径；vs FlashInfer k=3: c=1 −0.4%/c=5 −0.2%/**c=10 +4.0%**；accept 0.53；perf-neutral，可作生产 backend |
+| **RTX PRO 6000 / triton_attn k=4** | 2026-07-24 | MTP k=4 | triton_attn(target+draft) + **fp8 KV** | 84.2 | 340.4 | 658.0 | 0.304s | 13.8ms | ✅ **崩溃已修复且保留 fp8**（0 失败）；accept 0.45；同 backend 下 k=4 仍不赢 k=3（c=5/10 k=3 领先） |
 | **RTX PRO 6000 / vLLM 0.24.0 DFlash k=7** | 2026-07-23 | DFlash k=7 | 0.24.0 + `VLLM_USE_DEEP_GEMM=0`（绕过 0.25.1 NotImplementedError） | 76.0 | 295.9 | 499.2 | 0.328s | 17.8ms | 0.76× ✗ acceptance 0.20→回退 MTP |
 | **RTX PRO 6000 / vLLM 0.24.0 DFlash k=15** | 2026-07-23 | DFlash k=15 | README 推荐满配（block_size=16） | 72.0 | 256.5 | 400.7 | 0.344s | 22.0ms | 0.61× ✗ acceptance 0.10→回退 MTP |
 | ~~Baseline（thinking 开启）~~ | 2026-07-08 | MTP k=3 | 默认+thinking | 36.3 | 170.0 | 309.8 | 52.4s* | 6.4ms* | 参考 |
@@ -130,6 +132,42 @@ v0.25.1 结果：output_tps 80.1 / 345.5 / 644.7，TPOT(c=10)=14.1ms，acceptanc
 - **C/B/D**（同新配置，k=3/4/5）：acceptance 随深度递减 0.54→0.46→0.39，**k=3 在新配置下仍最优**。加深 k 无收益（marginal 位置接受的 token 几何衰减，各要一次 draft forward）。
 
 **决策**：生产维持 **FlashInfer + fp8 KV + k=3**（单流最优、高并发持平、保留 fp8 KV 优势）。崩溃修复的价值是「k≥4 可运行」的能力解锁（待未来 acceptance 跃迁/多卡 overlap 才有吞吐收益），非当前收益。原始报告：[`benchmark-flashattn_k4_full.md`](benchmark-flashattn_k4_full.md) / [`benchmark-flashattn_k3.md`](benchmark-flashattn_k3.md) / [`benchmark-flashattn_k5.md`](benchmark-flashattn_k5.md)。
+
+### MTP k≥4 崩溃修复（真因 + triton_attn，保留 fp8，2026-07-24）
+
+**背景**：上一节「FLASH_ATTN 修复」存在两处不严谨——① 一次改了 backend（FlashInfer→FLASH_ATTN）**和** kv dtype（fp8→bf16）两个变量，把生效归因于「FULL cudagraph」属 confound，未隔离真因；② 上游已知现象 `--attention-backend` 只作用于 target，**MTP draft head 仍独立选 FlashInfer**。本次参照上游 issue 与源码定位真因并给出**保留 fp8 KV** 的修复。
+
+**真因（上游已记录）**：模型 `/data/models/Qwen3.6-27B-FP8/config.json` 是**混合架构** `model_type=qwen3_5`（64 层 = 48 linear_attention/SSM + 16 full_attention，`full_attention_interval=4`，自带 `mtp_num_hidden_layers=1`）。SM120 **不在** trtllm-gen 支持的 SM100/103 family（`is_device_capability_family(100)`：SM120→`to_int()//10=12≠10`），故 FlashInfer 在 SM120 恒返回 `UNIFORM_SINGLE_TOKEN_DECODE`（源码 `vllm/v1/attention/backends/flashinfer.py:904-934`），spec-decode verify 被迫走 PIECEWISE cudagraph，命中 **FlashInfer `BatchPrefillWithPagedKVCache` 在 Blackwell 12.x（SM120/121）的 illegal-memory-access**——即上游 **#37754**（open，同款现象；评论 agata-corp 2026-06-24 在**同款 RTX PRO 6000 SM120 96GB** 上复现：MTP×高并发触发，`seq_lens.to("cpu")` 同步点炸；nightly 已重构该 lazy-eval）。同类 #36613（closed）/ #40756（open）。**不是** cudagraph 本身的 bug，是 FlashInfer kernel 在 SM120 的成熟度问题；升级 vllm 也改不了（trtllm-gen 无 SM120 cubin）。
+
+**修复（保留 fp8 KV，已实测验证）**：`triton_attn` 同时给 target **和** draft head——`triton_attn` 支持 fp8 KV（`supported_kv_cache_dtypes` 含 `fp8_e4m3`；SM120 有原生 `fp8e4nv`）**且** `_cudagraph_support=ALWAYS`（spec-decode verify 也给 FULL cudagraph），绕过 FlashInfer kernel。draft head 的 backend 经 `speculative_config.attention_backend` 单独指定（`vllm/config/speculative.py:119`→`llm_base_proposer.py:1300`，≤v0.23.0 已有）。compose：[`docker-compose.k4-triton.yml`](../docker-compose.k4-triton.yml) / [`docker-compose.k3-triton.yml`](../docker-compose.k3-triton.yml)。
+
+```
+--attention-backend triton_attn --kv-cache-dtype fp8_e4m3 \
+--speculative-config '{"method":"mtp","num_speculative_tokens":4,"attention_backend":"triton_attn"}'
+```
+
+**实测（v0.25.1 / RTX PRO 6000 SM120 / c=1,5,10 × 10 请求 × 2048 tok，全部 0 失败、容器全程 healthy、0 illegal-memory）**：
+
+| 配置 | c=1 | c=5 | c=10 | accept | 失败 |
+|------|:---:|:---:|:---:|:---:|:---:|
+| k=3 FlashInfer+fp8（生产基线） | 81.5 | 357.5 | 653.7 | 0.54 | 0 |
+| **k=3 triton_attn+fp8** | 81.2 | 356.9 | **679.9** | 0.53 | 0 |
+| k=4 triton_attn+fp8 | 84.2 | 340.4 | 658.0 | 0.45 | 0 |
+
+- **backend 对比（k=3 同口径）**：triton_attn vs FlashInfer = c=1 −0.4% / c=5 −0.2% / **c=10 +4.0%**，acceptance/TTFT 持平 → **triton_attn 是 perf-neutral 的生产可用 backend**，且给 spec-decode FULL cudagraph（FlashInfer 在 SM120 只 PIECEWISE），消除 k≥4 OOB 隐患。
+- **k 值对比（同 triton_attn+fp8）**：k=3 vs k=4 = c=1 k4 +3.7%（噪声）/ **c=5 k3 +4.8%** / **c=10 k3 +3.3%**，acceptance k3(0.53)>k4(0.45) → **干净证明 k=3 仍最优**。acceptance 每步衰减比≈0.70（k3/k4 一致），第 4 个 draft token（pos3）仅 ~34% 命中，边际价值低。
+
+**决策**：① 崩溃**可修**且**保留 fp8**——`triton_attn(target+draft)`；② k=3 仍最优（同 backend 干净复测确认）；③ 生产**维持 FlashInfer+fp8+k=3**（已稳定、k=3 无 OOB 风险）；`triton_attn` 作为「k≥4 / 稳定性裕度」**备用 backend** 记录在案（perf-neutral，未来若需 k≥4 或规避 FlashInfer 残余风险可一键切换）。原始报告：[`benchmark-mtp_k4_triton.md`](benchmark-mtp_k4_triton.md) / [`benchmark-mtp_k3_triton.md`](benchmark-mtp_k3_triton.md)。上游依据：[#37754](https://github.com/vllm-project/vllm/issues/37754) / [#36613](https://github.com/vllm-project/vllm/issues/36613)。
+
+#### 深层根因：为何 FlashInfer 本身「不可实际修复」（2026-07-25 复现 + 源码核证）
+
+为回答「能否不走 triton_attn、直接修好 FlashInfer」，复现并深挖（双 agent 源码核证 + 实测）：
+
+- **实测复现 traceback（v0.25.1 k=4 FlashInfer+fp8）**：c=1 稳、**c=10 全崩**（10/10 失败、`cudaErrorIllegalAddress`、容器 Exited）。链路 `_build_attention_metadata → flashinfer.py build → backend.py:seq_lens_cpu`（GPU→CPU sync）——但这是**异步检测点**，真实 OOB 在上一步的 FlashInfer **native fa2 `BatchPrefillWithPagedKVCache`** kernel（与上游 #37754 一致）。
+- **排除 workspace**：实测 `VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE=1GiB`（默认 394MiB）→ c=10 k=4 **照样崩**。上游 #48428（workspace 按头足迹放大）**不是**本崩溃修复。
+- **真因 = hybrid 强制 attention `block_size=1616`**：`vllm/platforms/interface.py:_align_hybrid_block_size` 中 `attn_block_size = kernel_align * cdiv(mamba_page_size, kernel_align*attn_page_size_1_token)`——GDN/Mamba 状态页（~3.3MB）强制 attention 页 ≥ mamba 页（**共享 block table**，不可独立配置，非 bug）。这个 1616-token 页喂给 FlashInfer native fa2 **越 spec**：vLLM 自家 gate `flashinfer.py:748` 只允许 `page_size>64` 走 SM100 **trtllm-gen** 路径，而 **SM120 无 trtllm-gen cubin** → 只能 native fa2 扛 1616 页 → 高并发/k≥4 下 OOB。c=1 稳/c=10 崩（block_id 量级）/k=4 触发（更长 derived KV）全由此解释。triton_attn 免疫：int64 直查 `block_table[req][pos//BLOCK]`，无扁平 paged_kv_indices、无 int32 stride。
+- **「参考 sglang」结论**：sglang 用的是**同一个** `BatchPrefillWithPagedKVCache` kernel，不崩是因为其 `HybridLinearAttnBackend` 把 full-attention 分页（**page_size=1**，in-spec）与 GDN/linear 状态分页**解耦**；vLLM 的 hybrid paging **耦合**（共享 block_size=1616）。要让 vLLM FlashInfer 用小页 = 采纳 sglang 式**按层组解耦分页**——vLLM 架构级改动，非 patch。
+- **定论**：本 hybrid 模型 + SM120 下，FlashInfer native fa2 在 k≥4 **无实际可修路径**（除非 ① trtllm-gen 出 SM120 cubin，或 ② vLLM 改解耦分页）。**生产用 triton_attn**（保 fp8 + FULL cudagraph + k≥4 稳 + perf-neutral）是正确解；FlashInfer 仅 k=3 稳。注：seq_lens 重构（#29624/#40654）**已在 v0.25.1**，非差异点。
 
 ### DFlash 复测（RTX PRO 6000 + vLLM 0.24.0，2026-07-23）
 
